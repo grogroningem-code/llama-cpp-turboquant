@@ -770,6 +770,64 @@ int main() {
         }
     });
 
+    t.test("turbo6 MMA partial decode over long streamed spans matches plain attention", [](testing & t) {
+        // 4096-token pages give each span far more KV tiles than the 64 KV parts
+        // the MMA decode path splits it into, unlike the 256-token pages above
+        // where most parts are empty. n_batch 1 = decode, 3 = MTP verify.
+        constexpr int64_t n_kv = 16384;
+        constexpr int64_t page_tokens = 4096;
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            return;
+        }
+
+        for (const ggml_type type_v : { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0 }) {
+            for (const int64_t n_batch : { int64_t(1), int64_t(3) }) {
+                const attention_inputs inputs =
+                    make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_TURBO6_0, type_v);
+                const std::vector<float> expected = run_attention(
+                    backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                    n_kv, n_batch);
+
+                const size_t k_page_bytes =
+                    ggml_row_size(GGML_TYPE_TURBO6_0, HEAD_DIM)*N_KV_HEAD*page_tokens;
+                const size_t v_page_bytes = ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*page_tokens;
+                ggml_backend_cuda_kv_stream_params params{};
+                params.device      = 0;
+                params.stage_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+                params.stage_slots = 1;
+                auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+                if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                    return;
+                }
+                const std::vector<float> actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                    n_kv, n_batch);
+                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+                if (!t.assert_equal(expected.size(), actual.size())) {
+                    return;
+                }
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+                }
+                std::fprintf(stderr, "turbo6 MMA decode V=%s n_batch=%lld max_abs=%g async_uploads=%llu\n",
+                    ggml_type_name(type_v), (long long) n_batch, max_abs,
+                    (unsigned long long) stats.asynchronous_page_uploads);
+                t.assert_true("long-span decode executes streamed attention",
+                    stats.asynchronous_page_uploads > 0);
+                t.assert_true("long-span decode remains numerically equivalent",
+                    std::isfinite(max_abs) && max_abs <= 5e-4f);
+            }
+        }
+    });
+
     t.test("all bounded-fallback KV pairs preserve streamed prefill results", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;

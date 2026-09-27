@@ -2234,6 +2234,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
             dstk_fixup_meta[(threadIdx.y/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
         }
+        // The shared meta slots now hold (max scale, rowsum), not the max, so a partial
+        // output takes the combined (max, rowsum) from registers here instead of below.
+        if (output_partial && !needs_fixup && !is_fixup && (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
+            const int jc = (threadIdx.y/np)*cols_per_warp + threadIdx.x;
+            const int j  = jc / ncols2;
+            const int c  = jc % ncols2;
+            if (jc < ncols && !((ncols1 > 1 && jt*ncols1 + j >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c >= gqa_ratio))) {
+                dstk_fixup[((jt*ncols1 + j)*ne02 + c)*gridDim.y] = make_float2(KQ_cmn, KQ_crs);
+            }
+        }
     } else if (np > 1) {
         // Warps with threadIdx.y % np == 0 execute a __syncthreads() in the if branch.
         // Therefore, all other warps also need to execute a __syncthreads().
@@ -2356,15 +2366,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                                 dstk_val.x /= KQ_rowsum_j;
                                 dstk_val.y /= KQ_rowsum_j;
                             }
-                        } else if (k00 == 0 && k == 0) {
+                        } else if (np == 1 && k00 == 0 && k == 0) {
                             const int row = (jt*ncols1 + j_dst)*ne02 + c_dst;
-                            dstk_fixup[row] = make_float2(meta_j[0], meta_j[1]);
+                            dstk_fixup[row*gridDim.y] = make_float2(meta_j[0], meta_j[1]);
                         }
 
+                        // Partial output interleaves the gridDim.y KV parts of each row.
+                        const int row_stride = output_partial ? int(gridDim.y) : 1;
                         if (is_fixup) {
                             dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
                         } else {
-                            dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = dstk_val;
+                            dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*row_stride*(DV/2) + k00 + k] = dstk_val;
                         }
                     }
                 }
@@ -2492,6 +2504,62 @@ static __global__ void flash_attn_ext_f16(
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
 
+    if constexpr (output_partial) {
+        // One block per (output tile, KV part), no stream-k: blockIdx.y splits the KV range so
+        // narrow decode queries still fill the GPU. Each part writes its unnormalized numerator
+        // and (max, sum) at row*gridDim.y + blockIdx.y, the layout the kv-stream accumulator reads.
+        // The host guarantees no sinks when gridDim.y > 1.
+        const int nparts   = gridDim.y;
+        const int kbc_tile = blockIdx.x*iter_k;
+        const int sequence =  kbc_tile /(iter_k*iter_j*iter_z_gqa*ne12);
+        const int z_KV     = (kbc_tile - iter_k*iter_j*iter_z_gqa*ne12 * sequence)/(iter_k*iter_j*iter_z_gqa);
+        const int zt_gqa   = (kbc_tile - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV)/(iter_k*iter_j);
+        const int jt       = (kbc_tile - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV - iter_k*iter_j * zt_gqa) / iter_k;
+
+        const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2;
+        const int row0 = (sequence*ne01.z*ne02 + zt_Q)*nparts + blockIdx.y;
+
+        const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
+        const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
+        const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+            (const half *) (mask + nb33*(sequence % ne33));
+        float2       * dstk   = ((float2 *) dst) + row0*(DV/2);
+        const half2  * V_h2   = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+        const float  * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+        const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
+
+        const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+
+        const int kb0_start = int(blockIdx.y)*iter_k/nparts;
+        int       kb0_stop  = int(blockIdx.y + 1)*iter_k/nparts;
+        if (KV_max && nparts == 1) {
+            kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+        }
+        if (kb0_start >= kb0_stop) {
+            // Short span (iter_k < nparts): process_tile needs a non-empty range, so write the
+            // neutral partial (zero numerator, zero sum) the accumulator weights to nothing.
+            for (int jc = threadIdx.y; jc < ncols; jc += nwarps) {
+                const int j = jc / ncols2;
+                const int c = jc % ncols2;
+                if (jt*ncols1 + j >= int(ne01.z) || zt_gqa*ncols2 + c >= gqa_ratio) {
+                    continue;
+                }
+                const int row = ((jt*ncols1 + j)*ne02 + c)*nparts;
+                for (int k = threadIdx.x; k < DV/2; k += warp_size) {
+                    dstk[row*(DV/2) + k] = make_float2(0.0f, 0.0f);
+                }
+                if (threadIdx.x == 0) {
+                    dst_meta[row0 + row] = make_float2(-FLT_MAX/2.0f, 0.0f);
+                }
+            }
+            return;
+        }
+        flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, false, false, type_K, type_V, output_partial>
+            (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta + row0, scale, slope, logit_softcap,
+             ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+        return;
+    }
+
     // kbc == k block continuous, current index in continuous ijk space.
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
     const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
@@ -2518,8 +2586,6 @@ static __global__ void flash_attn_ext_f16(
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
-        float2 * dst_meta_tile = output_partial ?
-            dst_meta + sequence*ne01.z*ne02 + zt_Q : dst_meta;
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
@@ -2534,12 +2600,12 @@ static __global__ void flash_attn_ext_f16(
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V, output_partial>
-                (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V, output_partial>
-                (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
 
@@ -2567,8 +2633,6 @@ static __global__ void flash_attn_ext_f16(
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
-    float2 * dst_meta_tile = output_partial ?
-        dst_meta + sequence*ne01.z*ne02 + zt_Q : dst_meta;
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
@@ -2583,7 +2647,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V, output_partial>
-        (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,

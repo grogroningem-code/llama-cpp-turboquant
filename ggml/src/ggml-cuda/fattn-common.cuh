@@ -1548,7 +1548,7 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE,
-    float * partial_dst = nullptr, float2 * partial_meta = nullptr
+    float * partial_dst = nullptr, float2 * partial_meta = nullptr, const int partial_nparts = 1
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1565,6 +1565,7 @@ void launch_fattn(
     const bool output_partial = partial_dst != nullptr;
     GGML_ASSERT(output_partial == (partial_meta != nullptr));
     GGML_ASSERT(!output_partial || !stream_k);
+    GGML_ASSERT(partial_nparts == 1 || (output_partial && sinks == nullptr));
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1776,8 +1777,9 @@ void launch_fattn(
             // into blockIdx.x. A multidimensional grid would duplicate every
             // tile once per KV head. One block per complete tile also avoids
             // fixups while preserving exact partial numerator/meta output.
+            // blockIdx.y splits each tile's KV range into partial_nparts parts.
             blocks_num.x = ntiles_dst;
-            blocks_num.y = 1;
+            blocks_num.y = partial_nparts;
             blocks_num.z = 1;
         } else {
             blocks_num.x = ntiles_x;

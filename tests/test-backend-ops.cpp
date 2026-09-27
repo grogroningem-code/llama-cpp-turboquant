@@ -11244,6 +11244,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(128));
     test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(256));
 
+    // Qwen3.8-27B geometry (hd 256, 4 KV heads, GQA 6): nb 1 = TG1, nb 3 = MTP verify, nb 512 = prefill ubatch
+    for (int nb : {1, 3, 512}) {
+        for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{
+                {GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0},
+                {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0},
+                {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0}, {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, nb, true, false, 0, 0,
+                GGML_PREC_F32, kv_types.first, kv_types.second));
+        }
+    }
+
     // sparse decode at long context
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));

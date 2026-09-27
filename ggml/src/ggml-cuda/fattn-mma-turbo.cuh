@@ -20,8 +20,10 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 
-template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
-void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool output_partial>
+static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * partial_dst, float2 * partial_meta, int partial_nparts) {
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -69,7 +71,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V, output_partial>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -80,7 +82,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V, output_partial>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -92,11 +94,36 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     }
 
     // need_f16_K = need_f16_V = false: launch_fattn does NOT convert turbo bytes to f16;
-    // the kernel receives raw quantized KV + the true byte pitch. stream_k = true.
+    // the kernel receives raw quantized KV + the true byte pitch. stream_k unless writing partials.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
-         /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
+         /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/!output_partial, /*use_sparse=*/false, warp_size_host,
+         partial_dst, partial_meta, partial_nparts);
 }
+
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_flash_attn_ext_mma_turbo_case_impl<DKQ, DV, ncols1, ncols2, type_K, type_V, false>(
+        ctx, dst, nullptr, nullptr, 1);
+}
+
+// kv-stream partial: unnormalized numerator + (max, sum) per row, KV range split into
+// partial_nparts parts (layout row*partial_nparts + part, see kv_stream_accumulate_chunk_results).
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_mma_turbo_partial_case(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * partial_dst, float2 * partial_meta, int partial_nparts) {
+    GGML_ASSERT(partial_dst != nullptr && partial_meta != nullptr);
+    ggml_cuda_flash_attn_ext_mma_turbo_case_impl<DKQ, DV, ncols1, ncols2, type_K, type_V, true>(
+        ctx, dst, partial_dst, partial_meta, partial_nparts);
+}
+
+#define DECL_FATTN_MMA_TURBO_PARTIAL_CASE(DKQ, DV, ncols1, ncols2, tK, tV)              template void ggml_cuda_flash_attn_ext_mma_turbo_partial_case                       <DKQ, DV, ncols1, ncols2, tK, tV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst,         float * partial_dst, float2 * partial_meta, int partial_nparts)
+
+// Streamed decode spans for the GQA-6 head-dim-256 pairs (ncols2 = 8, Q->ne[1] in {1..4}).
+#define DECL_FATTN_MMA_TURBO_PARTIAL_DECODE(tK, tV)                              extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 1, 8, tK, tV);         extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 2, 8, tK, tV);         extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 4, 8, tK, tV);     
+DECL_FATTN_MMA_TURBO_PARTIAL_DECODE(GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0);
+DECL_FATTN_MMA_TURBO_PARTIAL_DECODE(GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0);
 
 
 #define DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, ncols1, ncols2, tK, tV)                  \
