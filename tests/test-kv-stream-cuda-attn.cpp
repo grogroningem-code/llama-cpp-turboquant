@@ -770,7 +770,7 @@ int main() {
         }
     });
 
-    t.test("turbo6 MMA partial decode over long streamed spans matches plain attention", [](testing & t) {
+    t.test("turbo6/turbo5 MMA partial decode over long streamed spans matches plain attention", [](testing & t) {
         // 4096-token pages give each span far more KV tiles than the 64 KV parts
         // the MMA decode path splits it into, unlike the 256-token pages above
         // where most parts are empty. n_batch 1 = decode, 3 = MTP verify.
@@ -785,16 +785,21 @@ int main() {
             return;
         }
 
-        for (const ggml_type type_v : { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0 }) {
+        const std::pair<ggml_type, ggml_type> pairs[] = {
+            { GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0 }, { GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0 },
+            { GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0 }, { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0 },
+            { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0 }, { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0 },
+        };
+        for (const auto & [type_k, type_v] : pairs) {
             for (const int64_t n_batch : { int64_t(1), int64_t(3) }) {
                 const attention_inputs inputs =
-                    make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_TURBO6_0, type_v);
+                    make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
                 const std::vector<float> expected = run_attention(
                     backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
                     n_kv, n_batch);
 
                 const size_t k_page_bytes =
-                    ggml_row_size(GGML_TYPE_TURBO6_0, HEAD_DIM)*N_KV_HEAD*page_tokens;
+                    ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*page_tokens;
                 const size_t v_page_bytes = ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*page_tokens;
                 ggml_backend_cuda_kv_stream_params params{};
                 params.device      = 0;
@@ -817,8 +822,8 @@ int main() {
                 for (size_t i = 0; i < expected.size(); ++i) {
                     max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
                 }
-                std::fprintf(stderr, "turbo6 MMA decode V=%s n_batch=%lld max_abs=%g async_uploads=%llu\n",
-                    ggml_type_name(type_v), (long long) n_batch, max_abs,
+                std::fprintf(stderr, "MMA decode K=%s V=%s n_batch=%lld max_abs=%g async_uploads=%llu\n",
+                    ggml_type_name(type_k), ggml_type_name(type_v), (long long) n_batch, max_abs,
                     (unsigned long long) stats.asynchronous_page_uploads);
                 t.assert_true("long-span decode executes streamed attention",
                     stats.asynchronous_page_uploads > 0);
