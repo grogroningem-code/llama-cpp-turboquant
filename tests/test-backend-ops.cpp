@@ -10778,7 +10778,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // mixed turbo6_0 / turbo5_0 KV pairs, including the pairs that take the fused GQA-packed MMA path
     for (int kv : { 512, 1024, }) {
-        for (int nb : { 1, 2, 4, }) {
+        for (int nb : { 1, 2, 4, 75, }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0));
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0));
