@@ -1,0 +1,29 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+// 128 elements per block (QK_TURBO5 = 128)
+// Each workgroup processes one block. 128 threads, 1 element per thread.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_turbo5_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // must match TURBO5_CENTROIDS in ggml/src/ggml-turbo-quant.c
+    const float mag[16] = float[16](
+        0.005827, 0.017515, 0.029304, 0.041269, 0.053491, 0.066064, 0.079097, 0.092730,
+        0.107141, 0.122569, 0.139353, 0.158003, 0.179348, 0.204892, 0.237892, 0.288236
+    );
+
+    const uint ib  = gl_WorkGroupID.x;
+    const uint j   = gl_LocalInvocationID.x;  // element index 0..127
+
+    if (ib >= p.nel / 128) return;
+
+    const uint m = (uint(data_a[ib].qs[j / 2]) >> ((j % 2) * 4)) & 0xF;
+    const uint s = (uint(data_a[ib].qh[j / 8]) >> (j % 8)) & 0x1;
+    const float c = s != 0 ? -mag[m] : mag[m];
+
+    data_b[ib * 128 + j] = D_TYPE(c * float(data_a[ib].norm));
+}

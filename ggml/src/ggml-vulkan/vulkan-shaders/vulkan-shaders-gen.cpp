@@ -851,6 +851,13 @@ void process_shaders() {
     string_to_spv("get_rows_turbo4_0", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
     string_to_spv("get_rows_turbo4_0_f32", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
 
+    for (std::string t : {"turbo5_0", "turbo6_0"}) {
+        const std::string def = "DATA_A_" + to_uppercase(t);
+        string_to_spv("dequant_" + t, "dequant_" + t + ".comp", merge_maps(base_dict, {{def, "1"}, {"D_TYPE", "float16_t"}}));
+        string_to_spv("get_rows_" + t, "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {def, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
+        string_to_spv("get_rows_" + t + "_f32", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {def, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+    }
+
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
@@ -895,11 +902,13 @@ void process_shaders() {
     string_to_spv("cpy_turbo2_0_f32", "copy_from_quant.comp", {{"DATA_A_TURBO2_0", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("cpy_turbo3_0_f32", "copy_from_quant.comp", {{"DATA_A_TURBO3_0", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("cpy_turbo4_0_f32", "copy_from_quant.comp", {{"DATA_A_TURBO4_0", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("cpy_turbo5_0_f32", "copy_from_quant.comp", {{"DATA_A_TURBO5_0", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("cpy_turbo6_0_f32", "copy_from_quant.comp", {{"DATA_A_TURBO6_0", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     // tq4_1s copy-from-quant only; copy-to-quant requires WHT forward (handled in SET_ROWS path)
     string_to_spv("cpy_tq4_1s_f32", "copy_from_quant.comp", {{"DATA_A_TQ4_1S", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
-        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "turbo2_0", "turbo3_0", "turbo4_0", "tq4_1s"}) {
+        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "turbo2_0", "turbo3_0", "turbo4_0", "turbo5_0", "turbo6_0", "tq4_1s"}) {
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         }

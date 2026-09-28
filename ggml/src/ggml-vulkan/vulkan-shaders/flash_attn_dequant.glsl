@@ -46,6 +46,10 @@ layout (binding = 1, std430) restrict readonly buffer K_PACKED_TURBO3_0 { block_
 layout (binding = 2, std430) restrict readonly buffer V_PACKED_TURBO3_0 { block_turbo3_0 data[]; } v_packed_turbo3_0;
 layout (binding = 1, std430) restrict readonly buffer K_PACKED_TURBO4_0 { block_turbo4_0 data[]; } k_packed_turbo4_0;
 layout (binding = 2, std430) restrict readonly buffer V_PACKED_TURBO4_0 { block_turbo4_0 data[]; } v_packed_turbo4_0;
+layout (binding = 1, std430) restrict readonly buffer K_PACKED_TURBO5_0 { block_turbo5_0 data[]; } k_packed_turbo5_0;
+layout (binding = 2, std430) restrict readonly buffer V_PACKED_TURBO5_0 { block_turbo5_0 data[]; } v_packed_turbo5_0;
+layout (binding = 1, std430) restrict readonly buffer K_PACKED_TURBO6_0 { block_turbo6_0 data[]; } k_packed_turbo6_0;
+layout (binding = 2, std430) restrict readonly buffer V_PACKED_TURBO6_0 { block_turbo6_0 data[]; } v_packed_turbo6_0;
 
 // Q4_1 and Q5_1 packed32 views: aliased to the same memory as the packed16
 // views, used by the MMQ K-side hot path for fast 4-uint loads.
@@ -181,6 +185,44 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
     return FLOAT_TYPE(norm) * FLOAT_TYPEV4(c[i0], c[i1], c[i2], c[i3]);                           \
 }
 
+// TurboQuant5 dequant: 4-bit magnitude index + sign bit. iqs%4==0, so the 4 elements span 2 qs
+// bytes and 4 consecutive bits of one qh byte.
+#define FA_DEQUANT4_TURBO5_0(BUF) {                                                               \
+    const float c[16] = float[16](                                                                \
+        0.005827, 0.017515, 0.029304, 0.041269, 0.053491, 0.066064, 0.079097, 0.092730,  \
+        0.107141, 0.122569, 0.139353, 0.158003, 0.179348, 0.204892, 0.237892, 0.288236);                                                                                    \
+    const float norm = float(BUF.data[a_offset + ib].norm);                                       \
+    const uint b0 = uint(BUF.data[a_offset + ib].qs[iqs / 2    ]);                                \
+    const uint b1 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + 1]);                                \
+    const uint sg = uint(BUF.data[a_offset + ib].qh[iqs / 8]) >> (iqs & 0x7u);                    \
+    const vec4 s = vec4(1.0) - 2.0 * vec4(sg & 1u, (sg >> 1) & 1u, (sg >> 2) & 1u, (sg >> 3) & 1u);\
+    return FLOAT_TYPE(norm) * FLOAT_TYPEV4(s * vec4(c[b0 & 0xFu], c[(b0 >> 4) & 0xFu],            \
+                                                    c[b1 & 0xFu], c[(b1 >> 4) & 0xFu]));          \
+}
+
+// TurboQuant6 dequant: low nibble from qs, high 2 bits from qh. iqs%4==0, so the 4 elements
+// span 2 qs bytes and exactly one qh byte.
+#define FA_DEQUANT4_TURBO6_0(BUF) {                                                               \
+    const float c[64] = float[64](                                                                \
+        -0.330935, -0.286417, -0.257865, -0.236198, -0.218435, -0.203203, -0.189753, -0.177626,  \
+        -0.166522, -0.156230, -0.146600, -0.137517, -0.128895, -0.120663, -0.112765, -0.105157,  \
+        -0.097801, -0.090663, -0.083717, -0.076940, -0.070310, -0.063809, -0.057422, -0.051133,  \
+        -0.044929, -0.038798, -0.032729, -0.026710, -0.020733, -0.014787, -0.008863, -0.002953,  \
+        0.002953, 0.008863, 0.014787, 0.020733, 0.026710, 0.032729, 0.038798, 0.044929,  \
+        0.051133, 0.057422, 0.063809, 0.070310, 0.076940, 0.083717, 0.090663, 0.097801,  \
+        0.105157, 0.112765, 0.120663, 0.128895, 0.137517, 0.146600, 0.156230, 0.166522,  \
+        0.177626, 0.189753, 0.203203, 0.218435, 0.236198, 0.257865, 0.286417, 0.330935);                                                                                    \
+    const float norm = float(BUF.data[a_offset + ib].norm);                                       \
+    const uint b0 = uint(BUF.data[a_offset + ib].qs[iqs / 2    ]);                                \
+    const uint b1 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + 1]);                                \
+    const uint h  = uint(BUF.data[a_offset + ib].qh[iqs / 4]);                                    \
+    const uint i0 = ((b0     ) & 0xFu) | (((h     ) & 0x3u) << 4);                                 \
+    const uint i1 = ((b0 >> 4) & 0xFu) | (((h >> 2) & 0x3u) << 4);                                 \
+    const uint i2 = ((b1     ) & 0xFu) | (((h >> 4) & 0x3u) << 4);                                 \
+    const uint i3 = ((b1 >> 4) & 0xFu) | (((h >> 6) & 0x3u) << 4);                                 \
+    return FLOAT_TYPE(norm) * FLOAT_TYPEV4(c[i0], c[i1], c[i2], c[i3]);                           \
+}
+
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
         switch (FaTypeK) {
@@ -195,6 +237,8 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(k_packed_turbo2_0)
             case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0)
             case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0)
+            case FA_TYPE_TURBO5_0: FA_DEQUANT4_TURBO5_0(k_packed_turbo5_0)
+            case FA_TYPE_TURBO6_0: FA_DEQUANT4_TURBO6_0(k_packed_turbo6_0)
         }
     } else {
         switch (FaTypeV) {
@@ -209,6 +253,8 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(v_packed_turbo2_0)
             case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)
             case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0)
+            case FA_TYPE_TURBO5_0: FA_DEQUANT4_TURBO5_0(v_packed_turbo5_0)
+            case FA_TYPE_TURBO6_0: FA_DEQUANT4_TURBO6_0(v_packed_turbo6_0)
         }
     }
     return FLOAT_TYPEV4(0);
