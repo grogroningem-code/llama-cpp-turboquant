@@ -1,0 +1,43 @@
+// Smoke corpus for the draft-vocab DV32 builder (T2.2 exactness testing).
+// Synthetic mixed prose+code text. Good enough to exercise the flag-on path
+// and AC5 exactness; NOT representative enough for the AC6 bench thresholds,
+// which need a corpus drawn from real prompts (regenerate before T3.2).
+
+The draft head predicts the next token from a restricted vocabulary: only the
+most frequent tokens are kept in the fast projection. Everything else still
+flows through the full head during verification, so the final output is exact
+by construction. The speedup comes from a smaller matrix multiply per draft
+step, and the acceptance rate depends on how well the fixed set covers the
+prompt's distribution. Prose prompts reuse common words, punctuation, and
+formatting tokens; code prompts reuse keywords, brackets, and identifiers.
+
+Question: why does batch size matter for inference speed?
+Answer: larger batches amortize kernel launch overhead and improve memory
+bandwidth utilization, but they also grow the KV cache and activation memory.
+The right size is the one that keeps the GPU busy without spilling.
+
+```python
+def fib(n):
+    a, b = 0, 1
+    for _ in range(n):
+        yield a
+        a, b = b, a + b
+
+if __name__ == "__main__":
+    print(list(fib(16)))
+```
+
+```cpp
+#include <cstdio>
+int main() {
+    for (int i = 0; i < 16; i++) {
+        printf("i=%d\n", i);
+    }
+    return 0;
+}
+```
+
+Summarize the trade-off: a small draft set is fast but rejects more often;
+a large set accepts more but costs more per step. Thirty-two thousand tokens
+covers the head of the distribution for both prose and code while keeping the
+projection roughly eight times smaller than the full vocabulary matrix.

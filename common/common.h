@@ -361,6 +361,8 @@ struct common_params_speculative_draft {
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
 
+    std::string draft_vocab_path; // fixed draft id list for the MTP head (default: empty = off)
+    int32_t draft_vocab_extra = 0; // reserved for the v2 sequence ring (nonzero rejected in v1)
 };
 
 struct common_params_speculative_ngram_mod {

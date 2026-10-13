@@ -4217,6 +4217,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN"));
 
     add_opt(common_arg(
+        {"--spec-draft-vocab"}, "PATH",
+        "fixed draft id list (DV32 file) for the MTP draft head; empty = off (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.draft_vocab_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
+    add_opt(common_arg(
+        {"--spec-draft-extra"}, "N",
+        string_format("reserved for the v2 sequence ring; nonzero is rejected in v1 (default: %d)", params.speculative.draft.draft_vocab_extra),
+        [](common_params & params, int value) {
+            if (value != 0) {
+                throw std::invalid_argument("error: --spec-draft-extra is reserved for v2 (only 0 allowed)");
+            }
+            params.speculative.draft.draft_vocab_extra = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_EXTRA"));
+
+    add_opt(common_arg(
         {"--gdn-replay"},
         "[EXPERIMENTAL] for Gated DeltaNet models (Qwen3.5/3.5-MoE) with MTP rollback enabled: "
         "record small per-token ingredients and replay them to reconstruct rolled-back state, "
