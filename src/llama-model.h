@@ -617,6 +617,24 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // MTP draft-vocab subset head: runtime-gathered copy of output rows.
+    // empty (hash 0) = off. tensor lives in output_subset_ctx.
+    // mutable: lazy once-per-model cache filled by the setter on first use.
+    mutable std::pair<ggml_context_ptr, ggml_backend_buffer_ptr> output_subset_ctx;
+    mutable struct ggml_tensor * output_subset_w   = nullptr; // [n_embd, n_sub], same type as output
+    mutable struct ggml_tensor * output_subset_s   = nullptr; // shared scale tensor when the head has one
+    mutable const struct ggml_tensor * output_subset_src = nullptr; // head tensor the copy was gathered from
+    mutable std::vector<int32_t> output_subset_ids;           // vocab id per subset row
+    mutable struct ggml_tensor * output_subset_ids_w = nullptr; // [n_sub] I32 device copy, for in-graph remap
+    mutable uint64_t             output_subset_hash = 0;      // FNV-1a of ids
+
+    // subset head usable for this graph build: list installed, hash matches
+    // the build key, copy present, and the head source is the gathered one
+    bool output_subset_active(uint64_t want_hash, const struct ggml_tensor * head_w) const {
+        return want_hash != 0 && want_hash == output_subset_hash &&
+               output_subset_w != nullptr && head_w == output_subset_src;
+    }
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;

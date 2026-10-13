@@ -8,6 +8,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-draft-vocab.h"
 #include "speculative-adaptive.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -60,6 +61,13 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
 static bool common_speculative_mtp_chain_enabled(const common_params_speculative_draft & params) {
     const char * env = getenv("LLAMA_SPEC_CHAIN");
     return params.chain || (env != nullptr && std::strcmp(env, "0") != 0);
+}
+
+// tokenizer hash over vocab pieces in id order (single definition in
+// spec-draft-vocab.cpp; must match what tools/vocab_freq writes into DV32)
+static uint64_t common_speculative_draft_vocab_tokenizer_hash(struct llama_context * ctx) {
+    const llama_model * model = llama_get_model(ctx);
+    return spec_draft_vocab_tokenizer_hash(llama_model_get_vocab(model));
 }
 
 struct common_speculative_config {
@@ -1393,6 +1401,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    // fixed draft-vocab set for the MTP draft head, installed from
+    // --spec-draft-vocab; null = off. owns per-sequence rewind state. never
+    // mutates the set per step (no accept calls), so a handle bug costs
+    // acceptance rate only, never correctness
+    std::unique_ptr<spec_draft_vocab_handle> draft_vocab;
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1508,10 +1522,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             SPC_WRN("%s", "chained MTP is not supported for this model; using sequential MTP\n");
         }
 
+        // fixed draft-vocab subset for the single-head MTP path: load the
+        // file, install the gathered head on ctx_dft, own the rewind handle.
+        // loud fail-closed: a bad file or an unsupported mode aborts instead of
+        // silently drafting from the full head (that would fake a flag-on bench)
+        bool subset_on = false;
+        if (!this->params.draft_vocab_path.empty()) {
+            if (chain_heads) {
+                GGML_ABORT("spec-draft-vocab: chained multi-head MTP is not supported (single-head only)");
+            }
+            // chain_graph + subset stacks via the in-graph idmap remap; the
+            // pair reader keeps receiving real vocab ids, nothing changes below
+            const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+            std::vector<int32_t> subset_ids;
+            try {
+                subset_ids = spec_draft_vocab_load(this->params.draft_vocab_path, n_vocab_dft,
+                        common_speculative_draft_vocab_tokenizer_hash(ctx_dft));
+            } catch (const std::exception & e) {
+                SPC_ERR("spec-draft-vocab: %s\n", e.what());
+                GGML_ABORT("spec-draft-vocab: refusing to run with an unloadable draft set");
+            }
+            if (!llama_set_spec_draft_vocab(ctx_dft, subset_ids.data(), (int32_t) subset_ids.size())) {
+                GGML_ABORT("spec-draft-vocab: subset install failed (missing head, bad ids, or repacked head buffer; see log)");
+            }
+            draft_vocab.reset(new spec_draft_vocab_handle(subset_ids, (int32_t) n_seq));
+            subset_on = true;
+            SPC_INF("spec-draft-vocab: subset head on (%d ids)\n", (int) subset_ids.size());
+        }
+
         // offload draft sampling to the backend (chained drafting outputs several
         // rows per sequence, which backend sampling does not support)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !chain_graph) {
+        // subset rows are packed [n_sub]: a backend sampler would emit subset
+        // positions as if they were vocab ids, so its chains stay detached here
+        if (this->params.backend_sampling && !chain_graph && !subset_on) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1651,6 +1695,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // drop deferred rows of seq_id with pos >= pos_from; returns true if any dropped
     bool drop_deferred_from(llama_seq_id seq_id, llama_pos pos_from) {
+        // fixed-set bookkeeping only: a rewind bug here costs acceptance
+        // rate, never correctness (the set itself never changes per step)
+        if (draft_vocab) {
+            draft_vocab->drop_deferred_from(seq_id, pos_from);
+        }
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         size_t w = 0;
@@ -2023,6 +2073,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const llama_token id = (llama_token) lp[2*j + 0];
                     const float       p  =               lp[2*j + 1];
 
+                    // chain ids must be real vocab ids; out-of-range here means the
+                    // model emitted raw logits where pairs were promised, so stop
+                    // loudly instead of poisoning the target batch with id -1
+                    const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    if (id < 0 || id >= n_vocab_dft) {
+                        SPC_ERR("chain draft id %d out of range (n_vocab %d): model chain branch missing or broken\n",
+                                id, n_vocab_dft);
+                        return;
+                    }
+
                     SPC_DBG(" - seq_id %d, chain candidate %3d: %6d (%8.3f) '%s'\n",
                             seq_one, j, id, p,
                             common_token_to_piece(ctx_dft, id).c_str());
@@ -2144,7 +2204,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                // subset draft rows are packed [n_sub]: sample through the
+                // subset sampler so candidates map to vocab ids
+                if (draft_vocab) {
+                    common_sampler_sample_subset(smpl, ctx_dft, i_last[seq_id], true);
+                } else {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);

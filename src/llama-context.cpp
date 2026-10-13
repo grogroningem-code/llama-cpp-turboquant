@@ -133,6 +133,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.embeddings_nextn     = false;
     cparams.embeddings_nextn_masked = false;
     cparams.mtp_chain               = false;
+    cparams.spec_draft_subset       = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_arena_mib     = params.kv_stream_arena_mib;
     cparams.no_perf                 = params.no_perf;
@@ -1717,6 +1718,37 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_logits_subset_ith(int32_t i, int32_t * n_sub) {
+    // row stride is defined here: the subset extract path packs [n_sub]
+    // rows, so the sampler must not assume the n_vocab stride
+    const int64_t n = (int64_t) model.output_subset_ids.size();
+    if (n_sub) {
+        *n_sub = (int32_t) n;
+    }
+
+    output_reorder();
+
+    try {
+        if (logits.data == nullptr) {
+            throw std::runtime_error("no logits");
+        }
+        if (n == 0 || cparams.spec_draft_subset == 0 ||
+                cparams.spec_draft_subset != model.output_subset_hash) {
+            throw std::runtime_error("subset head off");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        return logits.data + j * n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid subset logits id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2013,6 +2045,134 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 
 void llama_context::set_mtp_chain(bool value) {
     cparams.mtp_chain = value;
+}
+
+bool llama_context::set_spec_draft_vocab(const int32_t * ids, int32_t n_ids) {
+    // storage is a lazy once-per-model cache in mutable model fields
+    const llama_model & model = this->model;
+
+    auto clear = [&]() {
+        // disarm only: the once-per-model copy is shared state, never freed here
+        cparams.spec_draft_subset = 0;
+    };
+
+    if (!ids || n_ids <= 0) {
+        clear();
+        return true;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    for (int32_t i = 0; i < n_ids; ++i) {
+        if (ids[i] < 0 || (int64_t) ids[i] >= n_vocab) {
+            return false;
+        }
+    }
+
+    uint64_t hash = 1469598103934665603ull;
+    for (int32_t i = 0; i < n_ids; ++i) {
+        uint32_t v = (uint32_t) ids[i];
+        for (int b = 0; b < 4; ++b) {
+            hash ^= (uint8_t) (v >> (8*b));
+            hash *= 1099511628211ull;
+        }
+    }
+    if (hash == model.output_subset_hash && model.output_subset_w) {
+        cparams.spec_draft_subset = hash;
+        return true;
+    }
+    if (model.output_subset_w) {
+        return false; // one list per model: contexts share the copy, no swaps
+    }
+
+    // MTP head source: first nextn layer, shared head or model output
+    const ggml_tensor * head = model.output;
+    const ggml_tensor * head_s = model.output_s;
+    for (auto & layer : model.layers) {
+        if (layer.nextn.eh_proj) {
+            if (layer.nextn.shared_head_head) {
+                head = layer.nextn.shared_head_head;
+                head_s = layer.nextn.shared_head_head_s;
+            }
+            break;
+        }
+    }
+    if (!head || !head->buffer) {
+        return false;
+    }
+    const int64_t n_embd = head->ne[0];
+    const size_t row_bytes = ggml_row_size(head->type, n_embd);
+    if (head->nb[1] != row_bytes) {
+        return false; // padded rows not supported
+    }
+
+    auto * buft = ggml_backend_buffer_get_type(head->buffer);
+    if (!buft) {
+        return false;
+    }
+    // repack (extra) buffer types have no tensor_get: reading rows back
+    // would call a null function pointer. refuse loudly instead
+    {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+            auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+            if (get_extra) {
+                for (auto * eb = get_extra(cpu_dev); eb && *eb; ++eb) {
+                    if (*eb == buft) {
+                        LLAMA_LOG_ERROR("%s: output head uses a repack buffer type, rows cannot be read back; retry with --no-repack\n", __func__);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    ggml_init_params p = { 3*ggml_tensor_overhead(), NULL, true };
+    ggml_context_ptr dev_ctx(ggml_init(p));
+    if (!dev_ctx) {
+        return false;
+    }
+    ggml_tensor * sub = ggml_new_tensor_2d(dev_ctx.get(), head->type, n_embd, n_ids);
+    ggml_set_name(sub, "output_subset_w");
+    // I32 idmap beside the gathered copy: lets chained drafting translate
+    // in-graph argmax positions to vocab ids without new graph inputs
+    ggml_tensor * sub_ids = ggml_new_tensor_1d(dev_ctx.get(), GGML_TYPE_I32, n_ids);
+    ggml_set_name(sub_ids, "output_subset_ids_w");
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(dev_ctx.get(), buft));
+    if (!buf) {
+        return false;
+    }
+    // mark weights so the scheduler keeps the subset matmul on this backend
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // gather rows through the host, once per model
+    std::vector<uint8_t> host(ggml_nbytes(head));
+    ggml_backend_tensor_get(head, host.data(), 0, host.size());
+    std::vector<uint8_t> packed((size_t) n_ids * row_bytes);
+    for (int32_t i = 0; i < n_ids; ++i) {
+        memcpy(packed.data() + (size_t) i * row_bytes, host.data() + (size_t) ids[i] * head->nb[1], row_bytes);
+    }
+    ggml_backend_tensor_set(sub, packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(sub_ids, ids, 0, (size_t) n_ids * sizeof(int32_t));
+
+    model.output_subset_ctx.first = std::move(dev_ctx);
+    model.output_subset_ctx.second = std::move(buf);
+    model.output_subset_w = sub;
+    model.output_subset_ids_w = sub_ids;
+    model.output_subset_s = const_cast<ggml_tensor *>(head_s); // shared per-tensor scale, no copy
+    model.output_subset_src = head;
+    model.output_subset_ids.assign(ids, ids + n_ids);
+    model.output_subset_hash = hash;
+    cparams.spec_draft_subset = hash;
+    return true;
+}
+
+const int32_t * llama_context::spec_draft_vocab_ids(int32_t * n_ids) const {
+    if (n_ids) {
+        *n_ids = (int32_t) model.output_subset_ids.size();
+    }
+    return model.output_subset_ids.empty() ? nullptr : model.output_subset_ids.data();
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2356,8 +2516,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(logits.data != nullptr);
 
         // chain mode: logits are [2, n_chain] (token_id, prob) pairs, not [n_vocab, n_tokens]
+        // subset mode: logits are [n_sub, n_tokens] draft rows, not [n_vocab, n_tokens]
         const size_t logits_bytes =
-            cparams.mtp_chain ? ggml_nbytes(t_logits) : (size_t) n_tokens * n_vocab * sizeof(float);
+            (cparams.mtp_chain || cparams.spec_draft_subset) ? ggml_nbytes(t_logits) : (size_t) n_tokens * n_vocab * sizeof(float);
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, logits_bytes);
     }
 
@@ -2814,12 +2975,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev * n_vocab;
+            // chain keeps its historical stride; subset rows are n_sub wide
+            const size_t row_w = cparams.mtp_chain ? n_vocab : (cparams.spec_draft_subset ? t_logits->ne[0] : n_vocab);
+            float * logits_out = logits.data + n_outputs_prev * row_w;
 
             if (n_outputs) {
                 // chain mode: logits are [2, n_chain] pairs, not [n_vocab, n_outputs]
+                // subset mode: logits are [n_sub, n_outputs] draft rows, not [n_vocab, n_outputs]
+                // a model advertising chain support must emit pairs; anything else is a
+                // missing chain branch upstream, so fail loudly instead of drafting garbage
+                if (cparams.mtp_chain) {
+                    GGML_ASSERT(t_logits->ne[0] == 2);
+                }
                 const size_t extract_bytes =
-                    cparams.mtp_chain ? ggml_nbytes(t_logits) : (size_t) n_outputs * n_vocab * sizeof(float);
+                    (cparams.mtp_chain || cparams.spec_draft_subset) ? ggml_nbytes(t_logits) : (size_t) n_outputs * n_vocab * sizeof(float);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, extract_bytes);
             }
         }
@@ -3195,8 +3364,13 @@ void llama_context::output_reorder() {
         const uint64_t i1 = output_swaps[s].i1;
 
         if (logits.size > 0) {
-            for (uint64_t k = 0; k < n_vocab; k++) {
-                std::swap(logits.data[i0 * n_vocab + k], logits.data[i1 * n_vocab + k]);
+            // subset rows are packed n_sub wide (see the subset extract path);
+            // full-vocab stride would scramble them across rows
+            const uint64_t row_w =
+                (cparams.spec_draft_subset && !model.output_subset_ids.empty())
+                ? (uint64_t) model.output_subset_ids.size() : n_vocab;
+            for (uint64_t k = 0; k < row_w; k++) {
+                std::swap(logits.data[i0 * row_w + k], logits.data[i1 * row_w + k]);
             }
         }
 
@@ -4719,7 +4893,7 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 }
 
 bool llama_model_supports_mtp_chain(const llama_model * model) {
-    return model != nullptr && model->arch == LLM_ARCH_QWEN35;
+    return model != nullptr && (model->arch == LLM_ARCH_QWEN35 || model->arch == LLM_ARCH_QWEN35MOE);
 }
 
 bool llama_model_uses_shared_position_draft(const llama_model * model) {
@@ -4728,6 +4902,18 @@ bool llama_model_uses_shared_position_draft(const llama_model * model) {
 
 void llama_set_mtp_chain(llama_context * ctx, bool value) {
     ctx->set_mtp_chain(value);
+}
+
+bool llama_set_spec_draft_vocab(llama_context * ctx, const int32_t * ids, int32_t n_ids) {
+    return ctx->set_spec_draft_vocab(ids, n_ids);
+}
+
+const int32_t * llama_spec_draft_vocab_ids(llama_context * ctx, int32_t * n_ids) {
+    return ctx->spec_draft_vocab_ids(n_ids);
+}
+
+float * llama_get_logits_subset_ith(llama_context * ctx, int32_t i, int32_t * n_sub) {
+    return ctx->get_logits_subset_ith(i, n_sub);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

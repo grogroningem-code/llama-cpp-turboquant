@@ -90,6 +90,9 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    // subset row for the MTP draft head: packed [n_sub] row, ids from
+    // spec_draft_vocab_ids. null/0 count when the subset head is off.
+    float * get_logits_subset_ith(int32_t i, int32_t * n_sub);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -128,6 +131,11 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_chain(bool value);
+    // install an MTP draft-vocab subset (empty/null clears it); gathers the
+    // head rows once per model on first use. returns false on bad ids.
+    bool set_spec_draft_vocab(const int32_t * ids, int32_t n_ids);
+    // installed subset id list, or null when off
+    const int32_t * spec_draft_vocab_ids(int32_t * n_ids) const;
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

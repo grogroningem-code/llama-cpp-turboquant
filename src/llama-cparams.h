@@ -39,6 +39,7 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
+    uint64_t spec_draft_subset;   // FNV-1a hash of the MTP draft id list, 0 = subset head off
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

@@ -130,6 +130,26 @@ LLAMA_API bool llama_model_uses_shared_position_draft(const struct llama_model *
 // row's in-graph argmax and hidden state. One decode drafts n_tokens tokens.
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
 
+// Install an MTP draft-vocab subset on a draft context (null/0 disarms it).
+// Gathers the head rows once per model on first use. One list per model:
+// reinstalling a different list fails. Not thread-safe, call before decode.
+// True on success, false on out-of-range ids, a missing head, a repacked
+// (unreadable) head buffer, or a conflicting reinstall. Off by default.
+LLAMA_API bool llama_set_spec_draft_vocab(struct llama_context * ctx, const int32_t * ids, int32_t n_ids);
+
+// Installed subset id list and count for the model, or null/0 when no list
+// is installed. This is model state, not per-context: a disarmed context
+// still reports the installed list.
+LLAMA_API const int32_t * llama_spec_draft_vocab_ids(struct llama_context * ctx, int32_t * n_ids);
+
+// Subset logits row for the MTP draft head: packed [n_sub] floats whose
+// positions map through llama_spec_draft_vocab_ids. Bypasses the backend
+// sampled-logits channel (full-vocab stride, incompatible with subset rows).
+// Sets *n_sub to the installed list size, then returns the row; returns null
+// in release builds when the subset head is off for this context (aborts in
+// debug builds).
+LLAMA_API float * llama_get_logits_subset_ith(struct llama_context * ctx, int32_t i, int32_t * n_sub);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

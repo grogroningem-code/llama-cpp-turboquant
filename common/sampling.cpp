@@ -5,6 +5,8 @@
 #include "log.h"
 #include "reasoning-budget.h"
 
+#include "../src/llama-ext.h" // staging API: subset-logits getter for the MTP draft head
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -156,6 +158,25 @@ struct common_sampler {
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
             }
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // subset draft rows: packed [n_sub] logits mapped to vocab ids by the
+    // src/ subset getter. bypasses the backend channel (full-vocab stride)
+    void set_logits_subset(struct llama_context * ctx, int idx) {
+        int32_t n_sub = 0;
+        const float * sub = llama_get_logits_subset_ith(ctx, idx, &n_sub);
+        GGML_ASSERT(sub != nullptr && n_sub > 0);
+
+        int32_t n_ids = 0;
+        const int32_t * ids = llama_spec_draft_vocab_ids(ctx, &n_ids);
+        GGML_ASSERT(ids != nullptr && n_ids == n_sub);
+
+        cur.resize(n_sub);
+        for (int32_t i = 0; i < n_sub; i++) {
+            cur[i] = llama_token_data{ids[i], sub[i], 0.0f};
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
@@ -593,7 +614,7 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+static llama_token common_sampler_sample_impl(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first, bool subset) {
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
@@ -606,27 +627,35 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    if (subset) {
+        gsmpl->set_logits_subset(ctx, idx);
+    } else {
+        gsmpl->set_logits(ctx, idx);
+    }
 
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
-    {
-        id = llama_get_sampled_token_ith(ctx, idx);
+    // the subset path never uses backend sampling (its chains stay detached
+    // while the subset head is on), so this early-out is full-vocab only
+    if (!subset) {
+        // Check if a backend sampler has already sampled a token in which case we
+        // return that token id directly.
+        {
+            id = llama_get_sampled_token_ith(ctx, idx);
 
-        if (id != LLAMA_TOKEN_NULL) {
-            LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
+            if (id != LLAMA_TOKEN_NULL) {
+                LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+                GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+                GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].id == id) {
+                        cur_p.selected = i;
+                        break;
+                    }
                 }
-            }
 
-            return id;
+                return id;
+            }
         }
     }
 
@@ -660,7 +689,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    if (subset) {
+        gsmpl->set_logits_subset(ctx, idx);
+    } else {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     llama_sampler_apply(rbudget,  &cur_p);
 
@@ -675,6 +708,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     return id;
+}
+
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, false);
+}
+
+// subset draft sampler for the MTP head: candidates carry vocab ids mapped
+// from subset positions. the verify sampler is untouched
+llama_token common_sampler_sample_subset(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, true);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {

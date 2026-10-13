@@ -690,6 +690,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             ggml_tensor * head_w2 = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
             ggml_tensor * head_s2 = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+            // stacked subset: draft from the gathered head; argmax positions
+            // are translated to vocab ids through the idmap below
+            GGML_ASSERT(params.cparams.spec_draft_subset == 0 || model.output_subset_active(params.cparams.spec_draft_subset, head_w2));
+            const bool chain_subset = model.output_subset_active(params.cparams.spec_draft_subset, head_w2);
+            if (chain_subset) {
+                head_w2 = model.output_subset_w;
+                head_s2 = model.output_subset_s;
+            }
 
             static const int64_t n_sub_env = [] {
                 const char * env = getenv("LLAMA_SPEC_CHAIN_SUB");
@@ -697,7 +705,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             }();
 
             ggml_tensor * logits_j;
-            if (n_sub_env > 0 && n_sub_env < head_w2->ne[1]) {
+            if (!chain_subset && n_sub_env > 0 && n_sub_env < head_w2->ne[1]) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
                 logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
@@ -709,18 +717,23 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             }
 
             ggml_tensor * id_j = ggml_argmax(ctx0, logits_j);
+            // stacked subset: id_j is a subset position; the pair and the
+            // recurrence need the real vocab id, p_j needs the position
+            ggml_tensor * id_real_j = chain_subset
+                ? ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.output_subset_ids_w, 1, model.output_subset_ids_w->ne[0]), id_j)
+                : id_j;
             ggml_tensor * probs_j = ggml_soft_max(ctx0, logits_j);
             ggml_tensor * p_j = ggml_get_rows(ctx0,
                     ggml_reshape_2d(ctx0, probs_j, 1, probs_j->ne[0]), id_j);
             p_j = ggml_reshape_2d(ctx0, p_j, 1, 1);
-            ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
+            ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_real_j, 1, 1), GGML_TYPE_F32);
             ggml_tensor * out_j = ggml_concat(ctx0, id_f, p_j, 0);
 
             logits_all = logits_all == nullptr ? out_j : ggml_concat(ctx0, logits_all, out_j, 1);
             h_all      = h_all      == nullptr ? h_next_j : ggml_concat(ctx0, h_all, h_next_j, 1);
 
             if (j + 1 < n_chain) {
-                ggml_tensor * tok_j = ggml_get_rows(ctx0, tok_embd_w, id_j);
+                ggml_tensor * tok_j = ggml_get_rows(ctx0, tok_embd_w, id_real_j);
                 proj_cur = build_proj(tok_j, h_next_j);
             }
         }
@@ -832,8 +845,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
-    cb(cur, "result_output", -1);
+    GGML_ASSERT(params.cparams.spec_draft_subset == 0 || model.output_subset_active(params.cparams.spec_draft_subset, head_w));
+    if (model.output_subset_active(params.cparams.spec_draft_subset, head_w)) {
+        cur = build_lora_mm(model.output_subset_w, cur, model.output_subset_s);
+        cb(cur, "result_output_subset", -1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+        cb(cur, "result_output", -1);
+    }
 
 
 
