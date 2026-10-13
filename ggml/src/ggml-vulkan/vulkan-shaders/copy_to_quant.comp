@@ -5,7 +5,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #include "types.glsl"
 
-#if defined(SET_ROWS) && (defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0))
+#if defined(SET_ROWS) && (defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO5_0) || defined(DATA_A_TURBO6_0))
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 const uint BLOCK_SIZE = 128;
 #elif defined(SET_ROWS) && QUANT_K == 1
@@ -746,6 +746,180 @@ void main() {
         float rn = sqrt(total);
         data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm_t4 / rn) : gnrm_t4);
     }
+}
+
+#elif defined(SET_ROWS) && (defined(DATA_A_TURBO5_0) || defined(DATA_A_TURBO6_0))
+// turbo5/turbo6: same normalize + WHT as the turbo4 block above (same sign tables), then the
+// nearest of 32/64 centroids by binary search over the midpoints, like nearest_centroid_{5,6}bit
+// in ggml-turbo-quant.c. Codes are staged in shared memory and packed by a few threads.
+const float TS1_Q[128] = float[128](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
+    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
+);
+const float TS2_Q[128] = float[128](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
+);
+const float TINV_Q = 0.08838834764831845;  // 1 / sqrt(128)
+#if defined(DATA_A_TURBO5_0)
+#define TQ_N 32
+const float TC_Q[32] = float[32](
+    -0.288236, -0.237892, -0.204892, -0.179348, -0.158003, -0.139353, -0.122569, -0.107141,
+    -0.092730, -0.079097, -0.066064, -0.053491, -0.041269, -0.029304, -0.017515, -0.005827,
+    0.005827, 0.017515, 0.029304, 0.041269, 0.053491, 0.066064, 0.079097, 0.092730,
+    0.107141, 0.122569, 0.139353, 0.158003, 0.179348, 0.204892, 0.237892, 0.288236
+);
+const float TM_Q[31] = float[31](
+    -0.263064, -0.221392, -0.192120, -0.168675, -0.148678, -0.130961, -0.114855, -0.099935,
+    -0.085914, -0.072580, -0.059778, -0.047380, -0.035287, -0.023410, -0.011671, 0.000000,
+    0.011671, 0.023410, 0.035287, 0.047380, 0.059778, 0.072580, 0.085914, 0.099935,
+    0.114855, 0.130961, 0.148678, 0.168675, 0.192120, 0.221392, 0.263064
+);
+#else
+#define TQ_N 64
+const float TC_Q[64] = float[64](
+    -0.330935, -0.286417, -0.257865, -0.236198, -0.218435, -0.203203, -0.189753, -0.177626,
+    -0.166522, -0.156230, -0.146600, -0.137517, -0.128895, -0.120663, -0.112765, -0.105157,
+    -0.097801, -0.090663, -0.083717, -0.076940, -0.070310, -0.063809, -0.057422, -0.051133,
+    -0.044929, -0.038798, -0.032729, -0.026710, -0.020733, -0.014787, -0.008863, -0.002953,
+    0.002953, 0.008863, 0.014787, 0.020733, 0.026710, 0.032729, 0.038798, 0.044929,
+    0.051133, 0.057422, 0.063809, 0.070310, 0.076940, 0.083717, 0.090663, 0.097801,
+    0.105157, 0.112765, 0.120663, 0.128895, 0.137517, 0.146600, 0.156230, 0.166522,
+    0.177626, 0.189753, 0.203203, 0.218435, 0.236198, 0.257865, 0.286417, 0.330935
+);
+const float TM_Q[63] = float[63](
+    -0.308676, -0.272141, -0.247031, -0.227316, -0.210819, -0.196478, -0.183690, -0.172074,
+    -0.161376, -0.151415, -0.142059, -0.133206, -0.124779, -0.116714, -0.108961, -0.101479,
+    -0.094232, -0.087190, -0.080329, -0.073625, -0.067060, -0.060616, -0.054277, -0.048031,
+    -0.041864, -0.035763, -0.029719, -0.023722, -0.017760, -0.011825, -0.005908, 0.000000,
+    0.005908, 0.011825, 0.017760, 0.023722, 0.029719, 0.035763, 0.041864, 0.048031,
+    0.054277, 0.060616, 0.067060, 0.073625, 0.080329, 0.087190, 0.094232, 0.101479,
+    0.108961, 0.116714, 0.124779, 0.133206, 0.142059, 0.151415, 0.161376, 0.172074,
+    0.183690, 0.196478, 0.210819, 0.227316, 0.247031, 0.272141, 0.308676
+);
+#endif
+
+shared float wht_q[128];
+shared float sg_acc_q[16];
+shared float gnrm_q;
+shared uint  code_q[128];
+
+void main() {
+    const uint t   = gl_LocalInvocationID.x;
+    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint gpr = p.ne00 / 128;
+
+    if (gpr == 0) return;
+    if (g >= gpr * p.ne21 * p.ne22 * p.ne23) return;
+
+    uint tmp = g;
+    const uint ig  = tmp % gpr; tmp /= gpr;
+    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
+    const uint i02 = tmp % p.ne02;
+    const uint i03 = tmp / p.ne02;
+
+    if (i01 >= p.ne01 || i02 >= p.ne02 || i03 >= p.ne03) return;
+
+    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
+    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
+    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
+
+    wht_q[t] = data_s[sb + t];
+    barrier();
+
+    float v2 = wht_q[t] * wht_q[t];
+    v2 = subgroupAdd(v2);
+    if (gl_SubgroupInvocationID == 0) sg_acc_q[gl_SubgroupID] = v2;
+    barrier();
+    if (t == 0) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_q[w];
+        gnrm_q = sqrt(total);
+    }
+    barrier();
+
+    wht_q[t] *= (gnrm_q > 1e-10) ? (1.0 / gnrm_q) : 0.0;
+    barrier();
+
+    wht_q[t] *= TS1_Q[t];
+    barrier();
+
+    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
+        if ((t % (2 * h)) < h) {
+            float a    = wht_q[t];
+            float b    = wht_q[t + h];
+            wht_q[t]     = a + b;
+            wht_q[t + h] = a - b;
+        }
+        barrier();
+    }
+
+    const float rv = wht_q[t] * TINV_Q * TS2_Q[t];
+
+    uint lo = 0u;
+    uint hi = TQ_N - 1u;
+    while (lo < hi) {
+        const uint mid = (lo + hi) / 2u;
+        if (rv < TM_Q[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+    code_q[t] = lo;
+
+    float rc = TC_Q[lo] * TC_Q[lo];
+    rc = subgroupAdd(rc);
+    if (gl_SubgroupInvocationID == 0u) sg_acc_q[gl_SubgroupID] = rc;
+    barrier();
+
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_q[w];
+        const float rn = sqrt(total);
+        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm_q / rn) : gnrm_q);
+    }
+
+#if defined(DATA_A_TURBO5_0)
+    // sign-magnitude: code c -> magnitude c < 16 ? 15 - c : c - 16, sign bit = c < 16
+    if (t < 64u) {
+        const uint c0 = code_q[2u * t];
+        const uint c1 = code_q[2u * t + 1u];
+        const uint m0 = c0 < 16u ? 15u - c0 : c0 - 16u;
+        const uint m1 = c1 < 16u ? 15u - c1 : c1 - 16u;
+        data_q[db].qs[t] = uint8_t(m0 | (m1 << 4u));
+    }
+    if (t < 16u) {
+        uint sb8 = 0u;
+        [[unroll]] for (uint j = 0; j < 8u; j++) {
+            sb8 |= (code_q[8u * t + j] < 16u ? 1u : 0u) << j;
+        }
+        data_q[db].qh[t] = uint8_t(sb8);
+    }
+#else
+    if (t < 64u) {
+        data_q[db].qs[t] = uint8_t((code_q[2u * t] & 0xFu) | ((code_q[2u * t + 1u] & 0xFu) << 4u));
+    }
+    if (t < 32u) {
+        uint hb = 0u;
+        [[unroll]] for (uint j = 0; j < 4u; j++) {
+            hb |= ((code_q[4u * t + j] >> 4u) & 0x3u) << (2u * j);
+        }
+        data_q[db].qh[t] = uint8_t(hb);
+    }
+#endif
 }
 
 #elif defined(SET_ROWS) && defined(DATA_A_TQ4_1S)

@@ -323,6 +323,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TURBO5_0,
+    GGML_TYPE_TURBO6_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -781,7 +783,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type");
+                const bool skip = (arg == "--spec-type" || arg == "--reasoning-revisit-nudge");
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -1179,7 +1181,7 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
             throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
         }
         if (!seen_args.insert(arg).second) {
-            const bool skip = (arg == "--spec-type");
+            const bool skip = (arg == "--spec-type" || arg == "--reasoning-revisit-nudge");
 
             if (!skip) {
                 LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -3689,6 +3691,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.reasoning_budget_message = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-end-nudge-budget"}, "N",
+        "fire the reasoning end nudge once when this many reasoning-budget tokens remain (i.e. N tokens before the exhaustion close); requires --reasoning-end-nudge-message; >= 1 (default: -1, disabled)",
+        [](common_params & params, int value) {
+            if (value < 1 && value != -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_end_nudge_budget = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_END_NUDGE_BUDGET"));
+    add_opt(common_arg(
+        {"--reasoning-end-nudge-message"}, "MESSAGE",
+        "static wrap-up message injected on the reasoning end nudge: tells the model the budget is almost up and it must finalize its thoughts; the reasoning section stays open; max 4096 chars (default: none)",
+        [](common_params & params, const std::string & value) {
+            if (value.size() > 4096) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_end_nudge_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_END_NUDGE_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-revisit-nudge"}, "N:MESSAGE",
+        "staged nudge that fires once per reasoning block after N reasoning tokens, but only after the model took itself back (\"actually\", \"hmm\", \"wait\", ...) --reasoning-revisit-count times past N; fires at a line end and the reasoning section stays open; repeat for more stages, each later stage counts afresh; message max 4096 chars (default: none)",
+        [](common_params & params, const std::string & value) {
+            const size_t colon = value.find(':');
+            if (colon == std::string::npos || colon == 0) { throw std::invalid_argument("format: N:MESSAGE"); }
+            const int n = std::stoi(value.substr(0, colon));
+            const std::string msg = value.substr(colon + 1);
+            if (n < 0 || msg.empty() || msg.size() > 4096) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_revisit_nudges.push_back({ n, msg });
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--reasoning-revisit-count"}, "N",
+        "take-backs needed past a --reasoning-revisit-nudge stage's token count before it fires (default: 3)",
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("must be >= 1"); }
+            params.sampling.reasoning_revisit_count = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--reasoning-revisit-retract-phrases"}, "P1|P2|...",
+        "take-back phrases counted by --reasoning-revisit-nudge, separated by |, matched case-insensitively at a sentence start (default: built-in English list)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_revisit_retract_phrases = string_split<std::string>(value, '|');
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},

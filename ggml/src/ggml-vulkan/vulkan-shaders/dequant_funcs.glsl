@@ -858,6 +858,58 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TURBO5_0)
+// magnitudes c[16 + m] of the 32 turbo5 centroids, must match TURBO5_CENTROIDS in ggml-turbo-quant.c
+const float turbo5_mag[16] = float[16](
+    0.005827, 0.017515, 0.029304, 0.041269, 0.053491, 0.066064, 0.079097, 0.092730,
+    0.107141, 0.122569, 0.139353, 0.158003, 0.179348, 0.204892, 0.237892, 0.288236
+);
+float turbo5_value(uint ib, uint j, uint a_offset) {
+    const uint m = (uint(data_a[a_offset + ib].qs[j / 2]) >> ((j % 2) * 4)) & 0xF;
+    const uint s = (uint(data_a[a_offset + ib].qh[j / 8]) >> (j % 8)) & 0x1;
+    return s != 0 ? -turbo5_mag[m] : turbo5_mag[m];
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(turbo5_value(ib, iqs, a_offset), turbo5_value(ib, iqs + 1, a_offset));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(turbo5_value(ib, iqs,     a_offset), turbo5_value(ib, iqs + 1, a_offset),
+                turbo5_value(ib, iqs + 2, a_offset), turbo5_value(ib, iqs + 3, a_offset));
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif
+
+#if defined(DATA_A_TURBO6_0)
+// must match TURBO6_CENTROIDS in ggml-turbo-quant.c
+const float turbo6_c[64] = float[64](
+    -0.330935, -0.286417, -0.257865, -0.236198, -0.218435, -0.203203, -0.189753, -0.177626,
+    -0.166522, -0.156230, -0.146600, -0.137517, -0.128895, -0.120663, -0.112765, -0.105157,
+    -0.097801, -0.090663, -0.083717, -0.076940, -0.070310, -0.063809, -0.057422, -0.051133,
+    -0.044929, -0.038798, -0.032729, -0.026710, -0.020733, -0.014787, -0.008863, -0.002953,
+    0.002953, 0.008863, 0.014787, 0.020733, 0.026710, 0.032729, 0.038798, 0.044929,
+    0.051133, 0.057422, 0.063809, 0.070310, 0.076940, 0.083717, 0.090663, 0.097801,
+    0.105157, 0.112765, 0.120663, 0.128895, 0.137517, 0.146600, 0.156230, 0.166522,
+    0.177626, 0.189753, 0.203203, 0.218435, 0.236198, 0.257865, 0.286417, 0.330935
+);
+float turbo6_value(uint ib, uint j, uint a_offset) {
+    const uint lo = (uint(data_a[a_offset + ib].qs[j / 2]) >> ((j % 2) * 4)) & 0xF;
+    const uint hi = (uint(data_a[a_offset + ib].qh[j / 4]) >> ((j % 4) * 2)) & 0x3;
+    return turbo6_c[lo | (hi << 4)];
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(turbo6_value(ib, iqs, a_offset), turbo6_value(ib, iqs + 1, a_offset));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(turbo6_value(ib, iqs,     a_offset), turbo6_value(ib, iqs + 1, a_offset),
+                turbo6_value(ib, iqs + 2, a_offset), turbo6_value(ib, iqs + 3, a_offset));
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif
+
 #if defined(DATA_A_TQ3_1S)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     // TQ3_1S: 8-level Lloyd-Max centroids for N(0,1). ASYMMETRIC -- must match

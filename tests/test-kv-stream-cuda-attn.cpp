@@ -157,6 +157,22 @@ bool backend_supports_plain_kv_pair(ggml_backend_t backend, ggml_type type_k, gg
     if (backend_has_fa_all_quants(backend)) {
         return true;
     }
+    const auto is_turbo56 = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
+    };
+    // turbo5/turbo6 blocks hold 128 values, so only a subset of the mixed
+    // pairs gets vec instances without GGML_CUDA_FA_ALL_QUANTS. Mirrors
+    // ggml_cuda_fattn_turbo56_pair_supported's non-FA_ALL_QUANTS branch in
+    // fattn.cu - the two must stay in sync or this helper would promise a
+    // plain reference run for a pair the dispatch refuses.
+    if (is_turbo56(type_k) || is_turbo56(type_v)) {
+        if (is_turbo56(type_k)) {
+            return type_v == type_k || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 ||
+                type_v == GGML_TYPE_Q8_0 || type_v == GGML_TYPE_F16 ||
+                (type_k == GGML_TYPE_TURBO6_0 && type_v == GGML_TYPE_TURBO5_0);
+        }
+        return type_k == GGML_TYPE_Q8_0;
+    }
     const auto is_kv_compat = [](ggml_type t) {
         return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
             t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
@@ -644,18 +660,22 @@ int main() {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
         // TurboQuant's native decode-inline kernel is only instantiated for
-        // turbo paired with {f16, q8_0, turbo2/3/4} - not the full
+        // turbo paired with {f16, q8_0, turbo2/3/4/5/6} - not the full
         // direct_attention-eligible set (Q4_0/Q4_1/Q5_0/Q5_1/BF16 don't pair
         // with turbo natively and correctly fall back to ATTENTION_F16
         // instead, exercised by the bounded-fallback test below). Kept as
         // its own test rather than folded into "all native CUDA KV pairs"
         // above, since that test assumes a fully-connected type set.
+        // turbo5/turbo6 are covered here too: HEAD_DIM is 256, which is one
+        // of the two head dims they have vec instances for (128 and 256).
         const ggml_type turbo_types[] = {
             GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+            GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0,
         };
         const ggml_type companion_types[] = {
             GGML_TYPE_F16, GGML_TYPE_Q8_0,
             GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+            GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0,
         };
 
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -686,6 +706,14 @@ int main() {
                 for (const bool swap : { false, true }) {
                     const ggml_type actual_k = swap ? type_v : type_k;
                     const ggml_type actual_v = swap ? type_k : type_v;
+
+                    // The plain (non-streamed) run below is this test's ground
+                    // truth, so a pair the ordinary dispatch has no instance
+                    // for (turbo5/turbo6 mixes in a default build) has nothing
+                    // to compare against - skip rather than fail.
+                    if (!backend_supports_plain_kv_pair(backend.get(), actual_k, actual_v)) {
+                        continue;
+                    }
 
                     const attention_inputs inputs =
                         make_inputs(n_kv, n_batch, n_kv - n_batch, actual_k, actual_v);
@@ -738,6 +766,69 @@ int main() {
                     t.assert_true("turbo pair remains numerically equivalent",
                         std::isfinite(max_abs) && max_abs <= 5e-4f);
                 }
+            }
+        }
+    });
+
+    t.test("turbo6/turbo5 MMA partial decode over long streamed spans matches plain attention", [](testing & t) {
+        // 4096-token pages give each span far more KV tiles than the 64 KV parts
+        // the MMA decode path splits it into, unlike the 256-token pages above
+        // where most parts are empty. n_batch 1 = decode, 3 = MTP verify.
+        constexpr int64_t n_kv = 16384;
+        constexpr int64_t page_tokens = 4096;
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            return;
+        }
+
+        const std::pair<ggml_type, ggml_type> pairs[] = {
+            { GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0 }, { GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0 },
+            { GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0 }, { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0 },
+            { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0 }, { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0 },
+        };
+        for (const auto & [type_k, type_v] : pairs) {
+            for (const int64_t n_batch : { int64_t(1), int64_t(3) }) {
+                const attention_inputs inputs =
+                    make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+                const std::vector<float> expected = run_attention(
+                    backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                    n_kv, n_batch);
+
+                const size_t k_page_bytes =
+                    ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*page_tokens;
+                const size_t v_page_bytes = ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*page_tokens;
+                ggml_backend_cuda_kv_stream_params params{};
+                params.device      = 0;
+                params.stage_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+                params.stage_slots = 1;
+                auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+                if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                    return;
+                }
+                const std::vector<float> actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                    n_kv, n_batch);
+                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+                if (!t.assert_equal(expected.size(), actual.size())) {
+                    return;
+                }
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+                }
+                std::fprintf(stderr, "MMA decode K=%s V=%s n_batch=%lld max_abs=%g async_uploads=%llu\n",
+                    ggml_type_name(type_k), ggml_type_name(type_v), (long long) n_batch, max_abs,
+                    (unsigned long long) stats.asynchronous_page_uploads);
+                t.assert_true("long-span decode executes streamed attention",
+                    stats.asynchronous_page_uploads > 0);
+                t.assert_true("long-span decode remains numerically equivalent",
+                    std::isfinite(max_abs) && max_abs <= 5e-4f);
             }
         }
     });

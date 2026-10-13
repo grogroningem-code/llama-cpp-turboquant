@@ -87,6 +87,7 @@ A green run means the cases that ran passed, not that your change was exercised.
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
+- **Builds**: the VS generator compiles the ~250 fattn `.cu` instances serially (`nvcc` cannot batch with `/MP`; `/m` only parallelizes across projects, and `ggml-cuda` is one project). On >4-core machines configure with `-G Ninja` from the start and build with `cmake --build -j 8` - a serial full FA_ALL_QUANTS CUDA build takes ~2h. 8 parallel build lanes are a must on both dev boxes.
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
 - **Vulkan**: SET_ROWS pipeline registration must include TURBO2_0/3_0/4_0 with `require_full_subgroups=true, subgroup_size=32`, or every turbo KV write aborts.
 - **CUDA dispatch**: TQ weights must be excluded from the mmvq path before the fused-TQ branch (`ggml_cuda_should_use_mmvq`), or `GGML_TQ_NATIVE=1` aborts.
