@@ -309,12 +309,34 @@ struct common_sampler * common_sampler_init(
 
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+        // reasoning end nudge: precompute the static wrap-up message once
+        // here, where the vocab is available. The message tokenizes whenever
+        // it is set - the sampler disables the half-configured state (budget
+        // missing) with a per-slot-once warning (review fix: the previous
+        // budget gate made that warning branch unreachable).
+        llama_tokens end_nudged;
+        if (!params.reasoning_end_nudge_message.empty()) {
+            end_nudged = common_tokenize(vocab, params.reasoning_end_nudge_message, false, true);
+        }
+
+        // reasoning revisit nudge: precompute each stage message
+        common_reasoning_revisit_cfg revisit;
+        for (const auto & [after, msg] : params.reasoning_revisit_nudges) {
+            revisit.nudges.push_back({ after, common_tokenize(vocab, msg, false, true) });
+        }
+        revisit.count            = params.reasoning_revisit_count;
+        revisit.retract_phrases  = params.reasoning_revisit_retract_phrases;
+
         rbudget = common_reasoning_budget_init(
             vocab,
             {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
+            REASONING_BUDGET_IDLE,
+            params.reasoning_end_nudge_budget,
+            end_nudged,
+            revisit);
 
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);

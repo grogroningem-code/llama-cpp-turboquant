@@ -1789,6 +1789,64 @@ uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
     return ring == nullptr ? 0 : ring->last_ring_peak_occupancy;
 }
 
+static bool ggml_cuda_turbo_mma_fused();
+
+// KV parts per streamed decode span on the turbo MMA partial path. The kernel packs a whole
+// GQA group per block, so a decode span has only n_kv_head tiles; splitting the span's KV range
+// is what fills the GPU. Decode rows (<= 4 queries) stay far inside the parts/meta workspace
+// bound of KV_STREAM_MAX_PARTS_PER_CHUNK*KV_STREAM_QUERY_WORKSPACE_TOKENS rows.
+constexpr int KV_STREAM_MMA_DECODE_PARTS = 64;
+
+// Narrow (decode / MTP verify) streamed spans for the fused-MMA turbo6/turbo5 K pairs at head dim
+// 256 with GQA in (4, 8]: the vec partial reads every KV head once per Q head and these K types are
+// slow to dequantize there, while the GQA-packed MMA tile decodes each KV head once per group.
+static bool kv_stream_use_mma_turbo_decode(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return ggml_cuda_turbo_mma_fused() && turing_mma_available(cc) &&
+        (K->type == GGML_TYPE_TURBO6_0 || K->type == GGML_TYPE_TURBO5_0) &&
+        (V->type == GGML_TYPE_TURBO5_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_0) &&
+        Q->ne[1] <= 4 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        dst->src[3] != nullptr && dst->src[4] == nullptr &&
+        Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] > 4 && Q->ne[2]/K->ne[2] <= 8;
+}
+
+template <ggml_type type_K, ggml_type type_V>
+static void kv_stream_mma_turbo_decode_partial(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * parts, float2 * meta, int nparts) {
+    const int64_t n_q = dst->src[0]->ne[1];
+    if (n_q <= 1) {
+        ggml_cuda_flash_attn_ext_mma_turbo_partial_case<256, 256, 1, 8, type_K, type_V>(ctx, dst, parts, meta, nparts);
+    } else if (n_q <= 2) {
+        ggml_cuda_flash_attn_ext_mma_turbo_partial_case<256, 256, 2, 8, type_K, type_V>(ctx, dst, parts, meta, nparts);
+    } else {
+        ggml_cuda_flash_attn_ext_mma_turbo_partial_case<256, 256, 4, 8, type_K, type_V>(ctx, dst, parts, meta, nparts);
+    }
+}
+
+template <ggml_type type_K>
+static void kv_stream_mma_turbo_decode_dispatch_v(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * parts, float2 * meta, int nparts) {
+    switch (dst->src[2]->type) {
+        case GGML_TYPE_TURBO5_0: kv_stream_mma_turbo_decode_partial<type_K, GGML_TYPE_TURBO5_0>(ctx, dst, parts, meta, nparts); break;
+        case GGML_TYPE_TURBO4_0: kv_stream_mma_turbo_decode_partial<type_K, GGML_TYPE_TURBO4_0>(ctx, dst, parts, meta, nparts); break;
+        case GGML_TYPE_TURBO3_0: kv_stream_mma_turbo_decode_partial<type_K, GGML_TYPE_TURBO3_0>(ctx, dst, parts, meta, nparts); break;
+        default: GGML_ABORT("unsupported V type for streamed MMA turbo decode");
+    }
+}
+
+static void kv_stream_mma_turbo_decode_dispatch(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * parts, float2 * meta, int nparts) {
+    if (dst->src[1]->type == GGML_TYPE_TURBO6_0) {
+        kv_stream_mma_turbo_decode_dispatch_v<GGML_TYPE_TURBO6_0>(ctx, dst, parts, meta, nparts);
+    } else {
+        GGML_ASSERT(dst->src[1]->type == GGML_TYPE_TURBO5_0);
+        kv_stream_mma_turbo_decode_dispatch_v<GGML_TYPE_TURBO5_0>(ctx, dst, parts, meta, nparts);
+    }
+}
+
 void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -1975,12 +2033,16 @@ void ggml_cuda_flash_attn_ext_streamed(
     const bool use_mma_prefill =
         Q->ne[1] > 8 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
-    const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
-    GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
+    const bool use_mma_decode = !effective_convert && !use_mma_prefill && kv_stream_use_mma_turbo_decode(dst);
+    const int partial_count = use_mma_prefill ? 1 :
+        use_mma_decode ? KV_STREAM_MMA_DECODE_PARTS : kv_stream_parts_per_chunk();
+    GGML_ASSERT(partial_count > 0 && (use_mma_decode || partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK));
     GGML_ASSERT(Q->ne[1] > 0 && nrows % Q->ne[1] == 0);
     const int64_t rows_per_query = nrows/Q->ne[1];
     const int64_t workspace_queries = use_mma_prefill ? Q->ne[1] :
         std::min<int64_t>(Q->ne[1], KV_STREAM_QUERY_WORKSPACE_TOKENS);
+    GGML_ASSERT(int64_t(partial_count)*workspace_queries <=
+        int64_t(KV_STREAM_MAX_PARTS_PER_CHUNK)*KV_STREAM_QUERY_WORKSPACE_TOKENS || use_mma_prefill);
     const size_t workspace_rows = size_t(workspace_queries*rows_per_query);
     const size_t workspace_elements = workspace_rows*dst->ne[0];
 
@@ -2379,8 +2441,13 @@ void ggml_cuda_flash_attn_ext_streamed(
                             ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
                 } else {
 #ifdef GGML_CUDA_FA_ALL_QUANTS
-                    GGML_ASSERT(native_partial != nullptr);
-                    native_partial(ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
+                    if (use_mma_decode) {
+                        kv_stream_mma_turbo_decode_dispatch(
+                            ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
+                    } else {
+                        GGML_ASSERT(native_partial != nullptr);
+                        native_partial(ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
+                    }
 #else
                     GGML_ABORT("native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS");
 #endif // GGML_CUDA_FA_ALL_QUANTS

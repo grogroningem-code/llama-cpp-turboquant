@@ -1826,6 +1826,40 @@ struct block_turbo4_0
 #define A_TYPE block_turbo4_0
 #endif
 
+// Mirrors block_turbo5_0 in ggml-common.h: 2 + 64 + 16 = 82 bytes. qs holds the 4-bit magnitude
+// index m of each value (|value| = c[16 + m] * norm), qh its sign bit (1 = negative).
+#define QUANT_K_TURBO5_0 128
+#define QUANT_R_TURBO5_0 1
+struct block_turbo5_0
+{
+    float16_t norm;
+    uint8_t qs[64];     // 4-bit magnitude indices, nibble-packed (2 per byte)
+    uint8_t qh[16];     // sign bits, 8 per byte, element i at bit i%8
+};
+#if defined(DATA_A_TURBO5_0)
+#define QUANT_K QUANT_K_TURBO5_0
+#define QUANT_R QUANT_R_TURBO5_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo5_0
+#endif
+
+// Mirrors block_turbo6_0 in ggml-common.h: 2 + 64 + 32 = 98 bytes. 6-bit code = low nibble in qs,
+// high 2 bits in qh (4 per byte, element i at bits 2*(i%4)).
+#define QUANT_K_TURBO6_0 128
+#define QUANT_R_TURBO6_0 1
+struct block_turbo6_0
+{
+    float16_t norm;
+    uint8_t qs[64];     // low 4 bits of each code, nibble-packed (2 per byte)
+    uint8_t qh[32];     // high 2 bits of each code, 4 per byte
+};
+#if defined(DATA_A_TURBO6_0)
+#define QUANT_K QUANT_K_TURBO6_0
+#define QUANT_R QUANT_R_TURBO6_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo6_0
+#endif
+
 
 #define QUANT_K_TQ3_1S 32
 #define QUANT_R_TQ3_1S 1

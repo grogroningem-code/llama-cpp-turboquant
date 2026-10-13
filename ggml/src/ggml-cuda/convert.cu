@@ -348,16 +348,27 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
-// turbo3/turbo4 -> f16, a half-warp per 128-value block, 8 values per lane. The generic path above
+// turbo3/turbo4/turbo5/turbo6 -> f16, a half-warp per 128-value block, 8 values per lane. The generic path above
 // reads the centroid table from __constant__ memory with per-thread indices, which serializes;
-// here each lane holds a table entry in a register and lookups are warp shuffles.
+// here each lane holds table entries in registers and lookups are warp shuffles.
 template <ggml_type type>
 static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half * __restrict__ y,
         const uint32_t nblk, const uint3 nbr, const uint3 ne01, const uint3 ne02,
         const int64_t s01, const int64_t s02, const int64_t s03) {
     const int lane = threadIdx.x;
     const int l    = lane % 16;
-    const float c  = type == GGML_TYPE_TURBO3_0 ? TURBO_CENTROIDS_3BIT[lane % 8] : TURBO_CENTROIDS_4BIT[lane % 16];
+    float c_lo;
+    [[maybe_unused]] float c_hi = 0.0f;
+    if constexpr (type == GGML_TYPE_TURBO6_0) {
+        c_lo = TURBO6_CENTROIDS[lane];
+        c_hi = TURBO6_CENTROIDS[32 + lane];
+    } else if constexpr (type == GGML_TYPE_TURBO5_0) {
+        c_lo = TURBO5_CENTROIDS[16 + lane % 16]; // magnitudes; c[15-m] == -c[16+m]
+    } else if constexpr (type == GGML_TYPE_TURBO3_0) {
+        c_lo = TURBO_CENTROIDS_3BIT[lane % 8];
+    } else {
+        c_lo = TURBO_CENTROIDS_4BIT[lane % 16];
+    }
 
     // The loop bound is warp-uniform so every lane reaches the shuffles.
     for (uint32_t w = blockIdx.x*blockDim.y + threadIdx.y; 2*w < nblk; w += gridDim.x*blockDim.y) {
@@ -370,13 +381,23 @@ static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half
         const uint2 r2  = fast_div_modulo(r1.x, ne02);  // x = i03, y = i02
         const int64_t src = r2.x*s03 + r2.y*s02 + r1.y*s01 + row.y;
 
-        uint32_t qs;       // turbo4: element m at bits 4m; turbo3: low 2 bits of element m at bits 2m
-        [[maybe_unused]] uint32_t hi = 0; // turbo3: high bit of element m at bit m
+        uint32_t qs;       // turbo4/5/6: 8 nibbles, element m at bits 4m; turbo3: low 2 bits of element m at bits 2m
+        [[maybe_unused]] uint32_t qh = 0; // turbo6: 2-bit high part of element m at bits 2m; turbo5: sign at bit m; turbo3: high bit of element m at bit m
         float norm;
-        if constexpr (type == GGML_TYPE_TURBO3_0) {
+        if constexpr (type == GGML_TYPE_TURBO6_0) {
+            const block_turbo6_0 * b = (const block_turbo6_0 *) vx + src;
+            qs   = uint32_t(*(const uint16_t *) (b->qs + 4*l)) | (uint32_t(*(const uint16_t *) (b->qs + 4*l + 2)) << 16);
+            qh   = *(const uint16_t *) (b->qh + 2*l);
+            norm = __half2float(b->norm);
+        } else if constexpr (type == GGML_TYPE_TURBO5_0) {
+            const block_turbo5_0 * b = (const block_turbo5_0 *) vx + src;
+            qs   = uint32_t(*(const uint16_t *) (b->qs + 4*l)) | (uint32_t(*(const uint16_t *) (b->qs + 4*l + 2)) << 16);
+            qh   = b->qh[l];
+            norm = __half2float(b->norm);
+        } else if constexpr (type == GGML_TYPE_TURBO3_0) {
             const block_turbo3_0 * b = (const block_turbo3_0 *) vx + src;
             qs   = *(const uint16_t *) (b->qs + 2*l);
-            hi   = b->signs[l];
+            qh   = b->signs[l];
             norm = __half2float(b->norm);
         } else {
             static_assert(sizeof(block_turbo4_0) == 66, "4-bit turbo4 layout expected");
@@ -391,10 +412,20 @@ static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half
             float v[2];
 #pragma unroll
             for (int k = 0; k < 2; ++k) {
-                const int idx = type == GGML_TYPE_TURBO3_0 ?
-                    ((qs >> (2*(m + k))) & 0x3) | (((hi >> (m + k)) & 1) << 2) :
-                    (qs >> (4*(m + k))) & 0xF;
-                v[k] = __shfl_sync(0xFFFFFFFF, c, idx, 32) * norm;
+                if constexpr (type == GGML_TYPE_TURBO6_0) {
+                    const int idx = ((qs >> (4*(m + k))) & 0xF) | (((qh >> (2*(m + k))) & 0x3) << 4);
+                    const float lo = __shfl_sync(0xFFFFFFFF, c_lo, idx & 31, 32);
+                    const float hi = __shfl_sync(0xFFFFFFFF, c_hi, idx & 31, 32);
+                    v[k] = (idx & 32 ? hi : lo) * norm;
+                } else if constexpr (type == GGML_TYPE_TURBO5_0) {
+                    const float mag = __shfl_sync(0xFFFFFFFF, c_lo, (qs >> (4*(m + k))) & 0xF, 32);
+                    v[k] = ((qh >> (m + k)) & 1 ? -mag : mag) * norm;
+                } else if constexpr (type == GGML_TYPE_TURBO3_0) {
+                    const int idx = ((qs >> (2*(m + k))) & 0x3) | (((qh >> (m + k)) & 1) << 2);
+                    v[k] = __shfl_sync(0xFFFFFFFF, c_lo, idx, 32) * norm;
+                } else {
+                    v[k] = __shfl_sync(0xFFFFFFFF, c_lo, (qs >> (4*(m + k))) & 0xF, 32) * norm;
+                }
             }
             out[m/2] = __floats2half2_rn(v[0], v[1]);
         }
@@ -809,9 +840,9 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             return dequantize_turbo_f16_cuda<GGML_TYPE_TURBO4_0>;
         case GGML_TYPE_TURBO6_0:
-            return dequantize_block_cont_cuda<QK_TURBO6, QR_TURBO6, dequantize_turbo6_0>;
+            return dequantize_turbo_f16_cuda<GGML_TYPE_TURBO6_0>;
         case GGML_TYPE_TURBO5_0:
-            return dequantize_block_cont_cuda<QK_TURBO5, QR_TURBO5, dequantize_turbo5_0>;
+            return dequantize_turbo_f16_cuda<GGML_TYPE_TURBO5_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_tq4_1s_warp_cuda<half>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
@@ -927,9 +958,9 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             return dequantize_turbo_f16_nc_cuda<GGML_TYPE_TURBO4_0>;
         case GGML_TYPE_TURBO6_0:
-            return dequantize_block_cuda<QK_TURBO6, QR_TURBO6, dequantize_turbo6_0>;
+            return dequantize_turbo_f16_nc_cuda<GGML_TYPE_TURBO6_0>;
         case GGML_TYPE_TURBO5_0:
-            return dequantize_block_cuda<QK_TURBO5, QR_TURBO5, dequantize_turbo5_0>;
+            return dequantize_turbo_f16_nc_cuda<GGML_TYPE_TURBO5_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s>;
         case GGML_TYPE_TQ3_1S:
