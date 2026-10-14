@@ -158,7 +158,14 @@ CTL-S2 7.2 / CAND-S2 8.3 / CAND-C2S 6.2 (tg, n=1).
   47.0/13.9 + 31.3/8.9. Both binaries decay across consecutive 35B runs
   (box fatigue, GPU pinned 100%); tg 13.9-14.6 in 3/4 cells + 1 outlier.
   Verdict: tg neutral, pp unmeasurable fatigued. No regression signal.
-- Vulkan (fresh build-vulkan, version 20 = 7dea94ffc): 4B-Vulkan1 G 104.4/14.4
-  vs P 104.2/14.7 (probabilistic live, texts differ); MoE-Vulkan1 S2 104.5/13.1
-  no -1, coherent. T7 validated on the second backend. No Vulkan code in this
-  batch (all 4 PRs are CUDA/common/models) - validation only.
+- Option-1 redo (2026-10-15, server-based, launcher flags, MBPP code,
+  acceptance-tracked, idle+warmup+gaps): 4B-CUDA merge parity med 107.8/107.8
+  (4/8); 4B probabilistic med 107.8->111.8 (+3.7%, 6/8, acc .685->.716);
+  MoE-Vulkan1-131k-b1024 merge med 21.45->23.1 (+7.7%, 6/8, acc up 7/8 pairs -
+  GDN fix plausibly sharpens target); MoE probabilistic neutral (23.1/23.15,
+  2/8 - greedy drafts already acc~0.8). Leg-1 under video load VOID, rerun clean.
+  Killed user :8081 once via name-wide taskkill (reported); PID-scoped kills only
+  since. Per-row logs: opt1-*.json (8 MBPP prompts each).
+- Vulkan (fresh build-vulkan, version 20): 4B-Vulkan1 G 104.4/14.4 vs P
+  104.2/14.7; MoE-Vulkan1 S2 104.5/13.1 no -1. No Vulkan code in this batch
+  (all 4 PRs are CUDA/common/models) - validation only.
