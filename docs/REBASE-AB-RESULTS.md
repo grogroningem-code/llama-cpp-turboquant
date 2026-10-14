@@ -151,3 +151,14 @@ CTL-S2 7.2 / CAND-S2 8.3 / CAND-C2S 6.2 (tg, n=1).
   -ngl 0 is the reference); n_used=10 MUL_MAT_ID added, 2/2 OK on CUDA0;
   alice ppl pre 1.6299 vs post 1.6219 (within +-0.015, no degradation).
 - Value of batch is correctness (EOG, GDN), not speed. No new flag.
+- Fit is default-ON in this fork (`fit_params=true`, common.h:504): omitting
+  `--fit` still runs the fitter. Explicit `--fit off` + `-ngl 99 -ncmoe 28`
+  unblocks MoE on the 8GB box (47.0/13.9, no refusal, no -1).
+- MoE --fit off A/B (32k, n=64): PRE 79.4/14.6 + 35.5/13.9 vs POST
+  47.0/13.9 + 31.3/8.9. Both binaries decay across consecutive 35B runs
+  (box fatigue, GPU pinned 100%); tg 13.9-14.6 in 3/4 cells + 1 outlier.
+  Verdict: tg neutral, pp unmeasurable fatigued. No regression signal.
+- Vulkan (fresh build-vulkan, version 20 = 7dea94ffc): 4B-Vulkan1 G 104.4/14.4
+  vs P 104.2/14.7 (probabilistic live, texts differ); MoE-Vulkan1 S2 104.5/13.1
+  no -1, coherent. T7 validated on the second backend. No Vulkan code in this
+  batch (all 4 PRs are CUDA/common/models) - validation only.
