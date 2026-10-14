@@ -339,6 +339,8 @@ struct common_params_speculative_draft {
     bool chain = false; // chained drafting: all n_max tokens in one GPU decode (MTP only)
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
