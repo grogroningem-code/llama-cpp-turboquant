@@ -49,6 +49,13 @@
 - AC5: MoE smoke, no `-1`/crash; chain untouched.
 - Out of scope: Eagle3/DFlash, acceptance-rate logging (accepted gap), server
   ckpt-replay helper unless trivially portable.
+- KNOWN GAP (Opus review 2026-10-14): upstream `server_accept_replay` NOT
+  ported. On a checkpoint-restore the rejection-accepted tokens are rechecked
+  by exact match (q was cleared), so most are dropped: output stays correct
+  but the speed gain is lost on that path. Unaffected regimes: 4B/MoE bench
+  (hybrid rollback covers draft depth, no full restore). Port the helper
+  before enabling probabilistic on targets that need full checkpoints or
+  where n_rs_seq is forced 0.
 
 ## Test plan (4B, owner flags, -c 131072, p1, n=512, temp 0.6)
 - greedy (flag off) x2 vs probabilistic x2, pp+tg; then temp-0 AC2 pair.

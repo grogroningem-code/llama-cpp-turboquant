@@ -453,6 +453,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
@@ -919,6 +922,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
@@ -1789,6 +1795,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // reset here rather than per round, or two identical requests differ
+        common_sampler_reset(smpls[seq_id].get());
+
         // note: the server calls begin() after the prefill decode, so stale defer
         // rows are already handled by the position-rewind trim in process(). Rows
         // that remain here belong to this prompt and feed the next draft decode.
@@ -2377,6 +2386,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // draft cutoff does not apply to it
             if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
