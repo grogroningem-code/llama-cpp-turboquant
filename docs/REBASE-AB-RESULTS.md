@@ -132,3 +132,22 @@ CTL-S2 7.2 / CAND-S2 8.3 / CAND-C2S 6.2 (tg, n=1).
   accepted tokens to exact-match recheck (speed lost on that path only).
 - Verdict: real, consistent gain at temp 0.6; keep flag (default-off).
   Flag for this box: add `--spec-draft-sampling probabilistic` to the S2V set.
+
+## T7: upstream batch 27978/29638/28068/29393 (2026-10-14, commits c12ac3e43 + fa0f5e530)
+
+- #29638 EOG stop (match path exact port + same guard in T6 rejection path);
+  #27978 mmid any-count fast path (byte-identical to upstream); #28068 GDN
+  fix via build_gdn_l2_norm (5 models present; bailingmoe3/kimi-k3 absent);
+  #29393 RMS_NORM+SCALE CUDA fusion (fuses the GDN pairs).
+- AC1/AC2: build green, arg-parser + spec-draft-vocab green.
+- AC3: 4B coherent, MoE no crash/no -1. MoE fit-refused identically pre+post
+  (box condition, also fails pre-port; 95.9/26.1 era numbers were old-base).
+- AC4: 4B pre vs post neutral (PRE 1490/42.0, POST-G 1489/43.6, POST-P
+  1506/45.2; whole box in a depressed regime that day, pre+post equally).
+- AC5: temp-0 pre vs post differs (1525 chars, content differs) = GDN live.
+- Opus review: no blockers, all faithful, rejection-EOG deviation correct.
+  NITs closed: comment style; fused-vs-CPU-ref temp-0 text identical (fused
+  kernel exact; GGML_CUDA_DISABLE_FUSION does NOT exist in this tree, CPU
+  -ngl 0 is the reference); n_used=10 MUL_MAT_ID added, 2/2 OK on CUDA0;
+  alice ppl pre 1.6299 vs post 1.6219 (within +-0.015, no degradation).
+- Value of batch is correctness (EOG, GDN), not speed. No new flag.
