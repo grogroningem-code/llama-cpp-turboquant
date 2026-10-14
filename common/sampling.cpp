@@ -837,8 +837,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
-            // same EOG stop as the match path (T7 deviation: upstream EOG fix
-            // postdates the rejection port, same bug shape applies here)
+            // same EOG stop as the match path
             if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
                 break;
             }
