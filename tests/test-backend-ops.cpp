@@ -5170,6 +5170,40 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// routed MoE + dense shared expert fused into one mmvq launch (single-token)
+struct test_mul_mat_id_shared : public test_case {
+    const ggml_type type;
+    const int64_t n;
+    ggml_tensor * routed = nullptr;
+    ggml_tensor * shared = nullptr;
+
+    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+
+    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
+        ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
+        routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
+        shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
+        return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -6931,20 +6965,21 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_bias;
     const bool with_gate;
     const bool with_lane_scale;
+    const bool no_fuse; // shape the MoE kernel cannot honor: skip the fusion-counter check, numerics still verified vs the unfused reference
     std::array<int64_t, 2> batch_dims;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool no_fuse = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), no_fuse(no_fuse), batch_dims(batch_dims) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, no_fuse);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6984,7 +7019,12 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     // Each case builds exactly one epilogue; require the counter for the one it built.
+    // no_fuse cases assert numerics via the unfused path instead (the MoE kernel
+    // cannot honor their payload, so fusion must stay off).
     const char * required_fusion() override {
+        if (no_fuse) {
+            return nullptr;
+        }
         return with_gate ? "mul_mat_glu" : (with_bias ? "mul_mat_bias" : nullptr);
     }
 
@@ -10167,6 +10207,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+    // shared-expert fusion is single-token only in this tree (the moe kernel
+    // takes no shared pointers), so only n=1 can fuse both outputs
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_mul_mat_id_shared(type, 1));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
@@ -10919,6 +10964,52 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale));
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
+                                // multi-token MoE (specdec verify): only shapes the
+                                // fused kernel honors - plain SWIGLU gate, no
+                                // bias/scale, batch within the type maximum
+                                if (use_id && with_gate && !with_bias && !with_lane_scale &&
+                                        glu_op == GGML_GLU_OP_SWIGLU && ggml_is_quantized(type)) {
+                                    int max_b = 8;
+                                    if (type == GGML_TYPE_Q3_K) {
+                                        max_b = 5;
+                                    } else if (type == GGML_TYPE_IQ3_S) {
+                                        max_b = 6;
+                                    } else if (type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_S ||
+                                            type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4) {
+                                        max_b = 7;
+                                    }
+                                    for (int64_t m_batch : {2, 4, 8}) {
+                                        if (m_batch > max_b) {
+                                            continue;
+                                        }
+                                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
+                                            use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
+                                    }
+                                }
+                                // Negative shapes: payload the multi-token MoE kernel cannot honor
+                                // (bias, non-SILU gate, lane scale). Fusion must stay off; numerics
+                                // still checked against the unfused reference path. Keyed on one
+                                // combo so the block emits exactly once
+                                if (use_id && with_gate && !b && !with_bias && !with_lane_scale &&
+                                        type == GGML_TYPE_Q4_K && glu_op == GGML_GLU_OP_SWIGLU) {
+                                    for (ggml_type ntype : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                                        for (int64_t m_batch : {2, 4}) {
+                                            test_cases.emplace_back(new test_mul_mat_vec_fusion(ntype, GGML_GLU_OP_SWIGLU,
+                                                m_batch, 32, 256, use_id, 16, 8, b, true, true, false, {1, 1}, true));
+                                        }
+                                    }
+                                    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_GEGLU,
+                                        4, 32, 256, use_id, 16, 8, b, false, true, false, {1, 1}, true));
+                                    // lane scale only matches NVFP4: use it so the case exercises the guard
+                                    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU,
+                                        4, 32, 256, use_id, 16, 8, b, false, true, true, {1, 1}, true));
+                                    // gate-less epilogues (scale/bias sites): the plain multi-token
+                                    // kernel would drop their payload, so fusion must stay off
+                                    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU,
+                                        4, 32, 256, use_id, 16, 8, b, true, false, false, {1, 1}, true));
+                                    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU,
+                                        4, 32, 256, use_id, 16, 8, b, false, false, true, {1, 1}, true));
+                                }
                             }
                         }
                     }
@@ -10941,6 +11032,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
+                    // rows at and just past the block limit (TOPK_MOE_ROWS_PER_BLOCK)
+                    test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({32, 9, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                 }
             }
         }
