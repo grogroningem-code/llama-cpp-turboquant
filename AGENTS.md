@@ -284,17 +284,20 @@ commit).
   (tg min/med/max) next to any claimed gain. One run per setup is smoke,
   not a result. A single leg that lands far off its siblings (e.g. 2x pp)
   is a regime change, not a win - investigate, do not average it in.
-- Fixtures must match deployment: ~20k-token agent turns (system + tools +
-  history) via full messages/tools arrays, answers >= 1024 tokens. Short
-  prose prompts measure nothing Hermes will see. Size recorded fixtures to
-  the real context, not to the box maximum.
+- Fixtures must match deployment: 4B ~75k-token turns (parallel-4 slots,
+  unified KV), MoE ~131k-token turns, via full messages/tools arrays,
+  answers >= 1024 tokens. Short prose prompts measure nothing Hermes will
+  see. Size recorded fixtures to the real context, not to the box maximum.
 - Idle-check the device in use (--device cuda|vulkan). nvidia-smi means
   nothing for iGPU runs; check CPU load there instead. Idle-gate every
   block, not just the run start.
 - Pooled acceptance first (sum accepted / sum draft_n per build), speed
   second. Different texts across builds invalidate tg comparisons; a
   temp-0 byte-identical leg is the required correctness control.
-- Context size (-c) matches deployment (~24576), not the box maximum.
+- Context size (-c) matches deployment (4B ~75k, MoE ~131k), never the
+  box maximum or the system-prompt best case. On this 8GB box MoE 131k
+  fits only on Vulkan1 (shared RAM); CUDA MoE tests shrink -c and label
+  themselves fusion tests, not deployment-speed tests.
   On small VRAM, KV and GPU-resident experts trade against each other:
   report -c and -ncmoe next to every number. A fusion test must maximize
   GPU-resident layers (shrink -c if needed); a deployment-speed test must
