@@ -112,12 +112,30 @@ via smoke, not by reading code alone.
 ## Acceptance
 
 - AC1: CUDA build green (llama-cli/llama-server/test-backend-ops), no new warnings.
+  DONE 2026-10-15 (commit 95c2e3c51; rebuilds T8B3/B4/B5 exit 0). Warning
+  scan: zero warnings introduced by the port; recompile of mmvq.cu surfaced
+  two PRE-EXISTING #177-D (unused `gate`, `gate_kbx_offset`, lines ~731/763
+  - outside all port hunks, present since before T8, masked before by
+  incremental builds). Left untouched.
 - AC2: new/changed backend-ops cases pass on CUDA0 (MUL_MAT_ID_SHARED,
   m_batch fusion, topk rows) - 0 skipped-as-pass.
+  DONE 2026-10-15: MUL_MAT_VEC_FUSION / TOPK_MOE / MUL_MAT_ID / ROLL all exit
+  0 on CUDA0, incl. 8 no_fuse negative cases (FUSION2:0).
 - AC3: temp-0 AC5 text identical pre/post on 4B (graph surgery in 28549 must
   not change outputs); MoE smoke no -1, coherent.
+  PARTIAL 2026-10-15: MTP-off temp-0 4B BYTE-IDENTICAL (base forward proven
+  bit-identical) + ppl neutral (1.6032->1.5887, overlapping bars) + MoE
+  smoke no -1 coherent + post deterministic across repeats. DEVIATION: MTP-on
+  temp-0 diverges pre/post (draft-path last-bit reorder, same benign class
+  as T7 GDN divergence) - accepted, documented in REBASE-AB-RESULTS.md.
 - AC4: server A/B (launcher flags, MBPP, acceptance): MoE tg must not regress;
   report 27621+29184 uplift if any (expect low single-digit % on 4070).
+  DONE 2026-10-15: MoE neutral (fusion on/off 31.9 vs 32.8, pre/post within
+  env drift); 4B neutral-or-parity. Uplift: NONE measurable on 8GB offload
+  (bandwidth-bound; Qwen3-MoE has no shared experts so 29184 cannot fire).
+  Full numbers in docs/REBASE-AB-RESULTS.md (T8 entries).
 - AC5: Opus impl review, no BLOCKERs.
+  DONE 2026-10-15: 1 BLOCKER found, fixed, re-review OK
+  (opus-review-t8port.log + opus-review-t8fix.log); all concerns closed.
 
 NOT in scope: Vulkan ports of these kernels (CUDA-only batch); 27B; chain.
