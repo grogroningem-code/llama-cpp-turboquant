@@ -19,7 +19,7 @@ o = {'order': 'ABBABABA', 'repeats': '3', 'n_predict': '1024', 'device': 'cuda'}
 pos, i = [], 0
 while i < len(a):
     if a[i].startswith('--') and i + 1 < len(a) and not a[i + 1].startswith('--') and a[i] != '--':
-        o[a[i][2:]] = a[i + 1]; i += 2
+        o[a[i][2:].replace('-', '_')] = a[i + 1]; i += 2
     elif a[i] == '--':
         pos = a[i + 1:]; break
     else:
@@ -70,15 +70,16 @@ def wait_idle(tag):
     return idle()
 
 def serve_block(tag, build):
+    print(f'LAUNCH {tag}/{build}: {[exe[build], "-m", model, "--port", port] + pos}', flush=True)
     srv = subprocess.Popen([exe[build], '-m', model, '--port', port] + pos,
                            stdout=open(f"{o['out']}.{tag}.server.log", 'w'),
                            stderr=subprocess.STDOUT)
     rows = []
     try:
-        for _ in range(120):
+        for _ in range(240):
             time.sleep(5)
             try:
-                if req('/health', timeout=10).get('status') in ('ok', 'loading'):
+                if req('/health', timeout=10).get('status') == 'ok':
                     break
             except Exception:
                 pass

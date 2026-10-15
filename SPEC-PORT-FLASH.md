@@ -132,3 +132,28 @@ enabling sparse for our models (they pass top_k=0 by arch design).
   (MTP-off byte-identical; MTP-on not diffed textually - parity speeds only,
   acceptable: FA batch cannot change sampling, and T0-identical proves it),
   AC4 DONE (parity everywhere, no uplift - as predicted), AC5 DONE.
+
+## Proper retest 2026-10-15 (new harness, ++method, t9-deep.json untracked)
+
+- Script fixes found by this run: hyphenated CLI flags never parsed
+  (--n-predict silently kept default 1024; first run measured n=1024 -
+  harmless but unintended), health check broke on 'loading' (HTTP 500 on
+  warm-up), server prompt cache made rep>=1 prefill meaningless
+  (ctx=4 second run). Fixed: underscore-normalized keys, wait for 'ok',
+  --no-cache-prompt, LAUNCH echo. All in bench-server-ab.py.
+- Setup: pre-t9/ vs T9 build, Qwen3.5-4B CUDA0, -c 76800, 2 deep fixtures
+  (ctx 55562/55436 - short of the 75k deployment max, disclosed),
+  order ABBA x 2 prompts x 2 reps = 16 runs, n_predict 512, cache off.
+- deep-A: CTL pp_med 2383 tg_med 44.3 (43.8-44.3) vs T9 pp_med 2420
+  tg_med 43.6 (42.8-43.8). deep-B: CTL 2390/44.2 (43.7-44.3) vs T9
+  2388/44.0 (43.6-44.1). pooled_acc 0.0 both (4B has no drafting - N/A).
+- Verdict: pp PARITY (within rep noise +-2-3%). tg parity within noise
+  with a slight negative lean on deep-A (-1.6% med) that does not
+  replicate on deep-B (-0.5%). ABBAx2x2 cannot resolve sub-2%; NOT
+  claimed as regression, flagged for the 8-block rerun with real
+  HF-trajectory fixtures.
+- MoE leg omitted on purpose: T9 touches CUDA-only files, so Vulkan1
+  131k pre/post would be code-identical (pure noise measurement);
+  CUDA0 cannot hold MoE 131k KV. MoE deployment-speed retest needs the
+  Lenovo; MoE fusion retest (T8 pair) needs the two builds + max-split
+  -ncmoe fit-search, queued next.
