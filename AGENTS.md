@@ -271,6 +271,41 @@ gh pr comment
 gh issue create
 ```
 
+## A/B and Review Gates (fork harness: scripts/bench-server-ab.py)
+
+Every perf claim must pass these before it is reported as a result. Each gate
+exists because a past claim failed it (non-interleaved blocks, single-run
+llama-cli noise, wrong-GPU idle check, unverified arch claim, junk in a code
+commit).
+
+- Interleave builds (default --order ABBABABA, 3+ blocks each), never one
+  block per build. Heat drift pushes all pairs in a block the same way.
+- Repeat each prompt in-block (--repeats 3+, fixed seed). Report noise
+  (tg min/med/max) next to any claimed gain. One run per setup is smoke,
+  not a result. A single leg that lands far off its siblings (e.g. 2x pp)
+  is a regime change, not a win - investigate, do not average it in.
+- Fixtures must match deployment: ~20k-token agent turns (system + tools +
+  history) via full messages/tools arrays, answers >= 1024 tokens. Short
+  prose prompts measure nothing Hermes will see. Size recorded fixtures to
+  the real context, not to the box maximum.
+- Idle-check the device in use (--device cuda|vulkan). nvidia-smi means
+  nothing for iGPU runs; check CPU load there instead. Idle-gate every
+  block, not just the run start.
+- Pooled acceptance first (sum accepted / sum draft_n per build), speed
+  second. Different texts across builds invalidate tg comparisons; a
+  temp-0 byte-identical leg is the required correctness control.
+- Context size (-c) matches deployment (~24576), not the box maximum.
+  On small VRAM, KV and GPU-resident experts trade against each other:
+  report -c and -ncmoe next to every number. A fusion test must maximize
+  GPU-resident layers (shrink -c if needed); a deployment-speed test must
+  use deployment -c and say the fusion is mostly unfired.
+- Arch claims (shared experts, layer counts) verified in the model loader
+  (src/models/<arch>.cpp) and flag semantics in common/arg.cpp, never from
+  filenames. -ncmoe is --n-cpu-moe: larger N means MORE layers on CPU.
+- Commit hygiene: audit git diff --stat before every commit. Code commits
+  contain code + plan docs only. Scratch diffs, JSON inputs, result logs,
+  helper scripts stay untracked on disk, never in the commit.
+
 ## Useful Resources
 
 To conserve context space, load these resources as needed:
