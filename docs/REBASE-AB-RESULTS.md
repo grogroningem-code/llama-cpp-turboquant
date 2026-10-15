@@ -168,4 +168,24 @@ CTL-S2 7.2 / CAND-S2 8.3 / CAND-C2S 6.2 (tg, n=1).
   since. Per-row logs: opt1-*.json (8 MBPP prompts each).
 - Vulkan (fresh build-vulkan, version 20): 4B-Vulkan1 G 104.4/14.4 vs P
   104.2/14.7; MoE-Vulkan1 S2 104.5/13.1 no -1. No Vulkan code in this batch
-  (all 4 PRs are CUDA/common/models) - validation only.
+  (all 4 PRs are CUDA/common/models) - validation only.- T8 MoE MTP-speed batch (2026-10-15, commit 95c2e3c51: 27621/28549/29184 +
+  27301 hook). Opus impl review: 1 BLOCKER (unguarded multi-token MoE sites)
+  fixed + re-review OK; 8 no_fuse regression cases green; CUDA
+  MUL_MAT_VEC_FUSION/TOPK_MOE/MUL_MAT_ID exit 0; Vulkan smoke 103/14.9.
+- T8 4B A/B (MTP n=2, short/full prose): MTP-on tg varies with acceptance
+  (pre 96.0/97.1 vs post 88.7/91.6/92.2, different token streams). MTP-off:
+  pre 53.2 vs post 54.5 (parity); MTP-off temp-0 texts BYTE-IDENTICAL (base
+  forward bit-identical); ppl pre 1.6032+-0.01753 vs post 1.5887+-0.01719
+  (overlap - neutral). MTP-on temp-0 diverges (draft-path last-bit reorder,
+  post deterministic across repeats). Verdict: dense neutral, no regression.
+- T8 MoE A/B (Tiel 35B-A3B, fit off, ngl99 ncmoe28, c32768, MTP n=2, short
+  prompt): seed42 pre 41.6/15.4 vs post 41.5/14.5; reversed-order rerun post
+  63.6/31.9 vs pre 72.8/34.6 (whole-run env drift tracks pp, not kernels).
+  Same-binary fusion on/off: 31.9 vs 32.8 (+-3% - fusion moves nothing here).
+  Seed43 warm: pre 30.3 vs post ~35 (+15% hint, n=1, not a claim).
+  Correctness: PRE on-vs-off texts MATCH; POST on-vs-off diverge late
+  (586/730, coherent cascade - multi-token verify fusion active); OFF
+  pre-vs-post diverge late (452/722 - topk 8-rows reorder, expected, matches
+  upstream 27621 behavior). Verdict: MoE NEUTRAL on 8GB offload
+  (bandwidth-bound; Qwen3-MoE has no shared experts so 29184 cannot fire).
+  Uplift, if any, needs full-VRAM (Lenovo) or a shared-expert model.
