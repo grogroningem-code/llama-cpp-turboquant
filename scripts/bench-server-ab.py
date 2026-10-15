@@ -4,9 +4,13 @@ Usage: bench-server-ab.py --ctl <server-exe> --cand <server-exe> --model <gguf>
     --port <p> --samp <sampling.json> --prompts <prompts.json> --out <out.json>
     [--order ABBABABA] [--repeats 3] [--n-predict 1024] [--device cuda|vulkan]
     [-- <extra server flags...>]
-Prompts json: list of {id, text}. Same seed per prompt in every rep and block
+Prompts json: list of {id, messages, tools?} passed straight to
+/v1/chat/completions (full agent turns: system prompt, history, tool defs).
+Legacy {id, text} still works (wrapped as one user message).
+Same seed per prompt in every rep and block
 (temp>0 + fixed seed => identical decode, so rep variance is pure system noise).
 Acceptance is pooled over all reps/blocks per build: sum(accepted)/sum(draft_n).
+prompt_n is printed per run so fixture depth can be checked.
 """
 import json, subprocess, sys, time, urllib.request
 
@@ -83,20 +87,22 @@ def serve_block(tag, build):
         req('/v1/chat/completions', {'messages': [{'role': 'user', 'content': 'Say hi.'}],
             'n_predict': 16, **samp}, timeout=300)  # warm-up, discarded
         for i, p in enumerate(prompts):
+            msgs = p.get('messages') or [{'role': 'user', 'content': p['text']}]
+            body_extra = {'tools': p['tools']} if p.get('tools') else {}
             for r in range(REPS):
                 if i or r:
                     time.sleep(30)  # heat gap
                 s = idle()
-                d = req('/v1/chat/completions', {'messages': [{'role': 'user', 'content': p['text']}],
-                    'n_predict': NPRED, 'seed': 1000 + i, **samp})
+                d = req('/v1/chat/completions', {'messages': msgs,
+                    'n_predict': NPRED, 'seed': 1000 + i, **body_extra, **samp})
                 tm = d['timings']
                 rows.append({'block': tag, 'build': build, 'id': p['id'], 'rep': r,
                     'prompt_n': tm['prompt_n'], 'pp': round(tm['prompt_per_second'], 1),
                     'gen_n': tm['predicted_n'], 'tg': round(tm['predicted_per_second'], 1),
                     'draft_n': tm.get('draft_n', 0),
                     'accepted': tm.get('draft_n_accepted', 0), 'idle': s})
-                print(f"{tag}/{build} {p['id']} r{r}: pp={rows[-1]['pp']} "
-                      f"tg={rows[-1]['tg']} n={rows[-1]['gen_n']} idle={s}", flush=True)
+                print(f"{tag}/{build} {p['id']} r{r}: ctx={rows[-1]['prompt_n']} "
+                      f"pp={rows[-1]['pp']} tg={rows[-1]['tg']} n={rows[-1]['gen_n']} idle={s}", flush=True)
     finally:
         srv.terminate()
     return rows
