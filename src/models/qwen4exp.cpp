@@ -1416,6 +1416,15 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         h.next_pos = pos + 1;
     }
 
+    {
+        ggml_tensor * ple = pmodel.per_layer_tok_embd;
+
+        const bool prefetch = pmodel.can_prefetch.count(ple);
+        if (prefetch) {
+            llama_prefetch_rows(ple, idx.data(), idx.size());
+        }
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 

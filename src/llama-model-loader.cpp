@@ -1304,6 +1304,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON || ggml_nbytes(cur) > auto_lazy_min_size) {
             const auto & w = require_weight(tn.str().c_str());
             lazy_tensor_ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(cur));
+            lazy_tensor_names.insert(tn.str());
 
             LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
                     __func__, tn.str().c_str(), ggml_nbytes(cur)/1024/1024);

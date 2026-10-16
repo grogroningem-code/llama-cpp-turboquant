@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -94,6 +95,13 @@ struct llama_model_loader {
 
     // byte ranges of TENSOR_READ_LAZY tensors, per file index
     std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
+
+    // names of TENSOR_READ_LAZY tensors (for prefetch gating, cf. llama_model::can_prefetch)
+    std::set<std::string> lazy_tensor_names;
+
+    bool lazy_has(const ggml_tensor * t) const {
+        return t && lazy_tensor_names.count(ggml_get_name(t)) > 0;
+    }
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
