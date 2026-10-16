@@ -1273,6 +1273,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
         }
 
+        // the fork slot cache (--moe-cache) and the upstream expert cache (--moe-cache-mib) must not be combined
+        if (params.moe_cache_size > 0 && params.moe_cache.mode_explicit &&
+            params.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF) {
+            throw std::invalid_argument("error: --moe-cache-mib cannot be combined with --moe-cache <mode>; pass --moe-cache off to use the upstream expert cache");
+        }
+
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2733,6 +2739,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-mib"}, "N",
+        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled; mutually exclusive with --moe-cache)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = (size_t) value*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "

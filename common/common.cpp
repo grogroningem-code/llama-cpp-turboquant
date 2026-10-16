@@ -1730,6 +1730,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
     cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
 
+    cparams.moe_cache_size = params.moe_cache_size;
+
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
             case COMMON_MOE_CACHE_MODE_OFF:

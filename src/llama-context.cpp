@@ -20,6 +20,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-cache.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -125,6 +126,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_threads_batch      = params.n_threads_batch;
     cparams.moe_cache_mode       = params.moe_cache_mode;
     cparams.moe_cache_budget_mib = params.moe_cache_budget_mib;
+    cparams.moe_cache_size       = params.moe_cache_size;
     cparams.yarn_ext_factor      = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor     = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast       = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;
@@ -774,6 +776,22 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (cparams.moe_cache_size > 0) {
+            if (cparams.pipeline_parallel || model.n_devices() > 1) {
+                throw std::runtime_error("MoE cache does not support multiple devices");
+            }
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
+                    break;
+                }
+            }
+            if (!moe_cache) {
+                throw std::runtime_error("MoE cache requires a GPU backend");
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -1089,6 +1107,7 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), arena.max_nodes,
                                        cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     if (!sched) {
         LLAMA_LOG_ERROR("%s: failed to recreate scheduler\n", __func__);
         return false;
@@ -1152,8 +1171,15 @@ void llama_context::sched_reserve() {
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
         model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
-    const ggml_moe_cache_mode moe_cache_mode =
+    const ggml_moe_cache_mode moe_cache_mode_initial =
         moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+    // the upstream expert cache (moe_cache_size) owns host-resident experts; keep the fork slot cache out
+    // (explicit ON + size is rejected in the ctor; AUTO/UNSPECIFIED downgrades here with a log line)
+    const ggml_moe_cache_mode moe_cache_mode =
+        cparams.moe_cache_size > 0 && moe_cache_mode_initial != GGML_MOE_CACHE_MODE_OFF ? GGML_MOE_CACHE_MODE_OFF : moe_cache_mode_initial;
+    if (cparams.moe_cache_size > 0 && moe_cache_mode != moe_cache_mode_initial) {
+        LLAMA_LOG_INFO("%s: fork MoE slot cache disabled (upstream expert cache active)\n", __func__);
+    }
     const char * moe_cache_requested = "provider";
     switch (cparams.moe_cache_mode) {
         case LLAMA_MOE_CACHE_MODE_OFF:
@@ -1173,6 +1199,7 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                                        cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
 
     llama_memory_context_ptr mctx;
@@ -1376,6 +1403,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                    max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -3567,6 +3595,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.loras       =*/loras.get(),
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
+        /*.moe_cache   =*/moe_cache.get(),
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),
@@ -3592,6 +3621,8 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    copy_experts.reset();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3600,6 +3631,90 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+
+    // the slot maps of the MoE cache
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+        return true;
+    }
+
+    auto & st = lctx->copy_experts;
+
+    // the ids must be computed before the split starts, so only the first node of the split is considered
+    if (ggml_graph_n_nodes(graph) == 0) {
+        return false;
+    }
+    const ggml_tensor * node = ggml_graph_node(graph, 0);
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        return false;
+    }
+
+    const ggml_tensor * ids = node->src[2];
+    if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend);
+
+        st.used.assign(n_expert, false);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                st.used[id] = true;
+            }
+        }
+
+        st.ids = ids;
+    }
+
+    // group consecutive experts and copy them together
+    for (int64_t first = 0; first < n_expert; ) {
+        if (!st.used[first]) {
+            first++;
+            continue;
+        }
+        int64_t last = first;
+        while (last + 1 < n_expert && st.used[last + 1]) {
+            last++;
+        }
+
+        // the experts in the MoE cache are copied from device memory, the others are uploaded
+        int64_t next = first;
+        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
+            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+            if (n == 0) {
+                e++;
+                continue;
+            }
+            if (next < e) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+            }
+            e   += n;
+            next = e;
+        }
+
+        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+        const size_t offset  = next*expert_size;
+        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t size    = (last + 1 - next)*expert_size + padding;
+        if (size > 0) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        }
+
+        first = last + 1;
+    }
+
+    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -4372,6 +4487,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (moe_cache) {
+        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -4553,6 +4673,7 @@ void llama_context::opt_epoch_iter(ggml_opt_dataset_t               dataset,
                                             sizeof(float));
                 }
             }
+            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch) / n_ubatch + 1,
@@ -4648,6 +4769,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/GGML_TYPE_F16,
         /*.moe_cache_mode              =*/LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/0,
+        /*.moe_cache_size              =*/0,
         /*.abort_callback              =*/nullptr,
         /*.abort_callback_data         =*/nullptr,
         /*.embeddings                  =*/false,
@@ -4700,6 +4822,11 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__,
                         ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.moe_cache_size > 0 && params.moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON) {
+        LLAMA_LOG_ERROR("%s: moe_cache_size (upstream expert cache) cannot be combined with moe_cache_mode=ON (fork slot cache)\n", __func__);
         return nullptr;
     }
 
