@@ -1459,7 +1459,7 @@ void llama_context::sched_reserve() {
     const ggml_moe_cache_mode moe_cache_mode_initial =
         moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
     // the upstream expert cache (moe_cache_size) owns host-resident experts; keep the fork slot cache out
-    // (explicit ON + size is rejected in the ctor; AUTO/UNSPECIFIED downgrades here with a log line)
+    // (explicit ON/AUTO + size is rejected in the ctor; UNSPECIFIED downgrades here with a log line)
     const ggml_moe_cache_mode moe_cache_mode =
         cparams.moe_cache_size > 0 && moe_cache_mode_initial != GGML_MOE_CACHE_MODE_OFF ? GGML_MOE_CACHE_MODE_OFF : moe_cache_mode_initial;
     if (cparams.moe_cache_size > 0 && moe_cache_mode != moe_cache_mode_initial) {
@@ -5162,8 +5162,8 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         return nullptr;
     }
 
-    if (params.moe_cache_size > 0 && params.moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON) {
-        LLAMA_LOG_ERROR("%s: moe_cache_size (upstream expert cache) cannot be combined with moe_cache_mode=ON (fork slot cache)\n", __func__);
+    if (params.moe_cache_size > 0 && (params.moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON || params.moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO)) {
+        LLAMA_LOG_ERROR("%s: moe_cache_size (upstream expert cache) cannot be combined with moe_cache_mode=ON/AUTO (fork slot cache)\n", __func__);
         return nullptr;
     }
 
