@@ -936,7 +936,7 @@ ggml_tensor * llama_memory_hybrid_idx_context::gather_mla_rows(
     return ggml_get_rows(ctx, rows, ggml_reshape_1d(ctx, idxs, n_rows));
 }
 
-// k-pool DSA indexer (glm5-next)
+// k-pool DSA indexer (glm5-next, qwen4exp QSA)
 
 // Sizes only, used by the full cache context so get_n_kpool() works during graph reserve.
 llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kpool_build_sizes() const {
@@ -961,6 +961,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & ubatch) {
     const auto & lay = mem->kpool_layout_get();
     auto & st = *kpool_st;
+
     st.n_pool_real = lay.n_pool_real;
     st.cache_safe  = lay.cache_safe;
     st.n_new       = 0;

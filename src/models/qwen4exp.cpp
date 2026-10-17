@@ -798,8 +798,6 @@ public:
             return false;
         }
 
-        const int64_t n_kv = idx->get_n_kv();
-
         bool res = true;
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
