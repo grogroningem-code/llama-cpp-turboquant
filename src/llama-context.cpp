@@ -127,6 +127,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.moe_cache_mode       = params.moe_cache_mode;
     cparams.moe_cache_budget_mib = params.moe_cache_budget_mib;
     cparams.moe_cache_size       = params.moe_cache_size;
+    cparams.prefill_borrow_mib   = params.prefill_borrow_mib;
+    cparams.prefill_chunk_tokens = params.prefill_chunk_tokens;
     cparams.yarn_ext_factor      = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor     = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast       = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;
@@ -816,6 +818,9 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // T10.3: return any outstanding slab loan before the scheduler dies.
+    prefill_borrow_cleanup();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1137,12 +1142,290 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     return true;
 }
 
+// T10.3 prefill-borrow (DESIGN-T10.3.md sections 8-9). Opt-in via
+// --prefill-borrow; flag off (default) never reaches past resolve().
+namespace {
+constexpr uint32_t prefill_borrow_min_tokens = 512; // S2 gate: small prompts skip the phase switch
+}
+
+void llama_context::prefill_borrow_reset_graphs(uint32_t max_nodes) {
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+}
+
+void llama_context::prefill_borrow_refresh_sizes() {
+    if (model.hparams.no_alloc) {
+        return;
+    }
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+    }
+}
+
+void llama_context::prefill_borrow_new_sched(uint32_t max_nodes) {
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                       max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (!sched) {
+        throw std::runtime_error("prefill borrow: failed to recreate scheduler");
+    }
+    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_moe_cache(sched.get(),
+        (ggml_moe_cache_mode) prefill_borrow.fork_mode, prefill_borrow.fork_budget_mib);
+}
+
+bool llama_context::prefill_borrow_reserve_graphs(uint32_t chunk_tokens, const llama_memory_context_i * mctx) {
+    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_outputs = std::min(chunk_tokens, cparams.n_outputs_max);
+    return graph_reserve(chunk_tokens, n_seqs, n_outputs, mctx) != nullptr;
+}
+
+bool llama_context::prefill_borrow_resolve(ggml_moe_cache_mode fork_mode) {
+    auto & b = prefill_borrow;
+    b.configured = cparams.prefill_borrow_mib != 0;
+    b.eligible = false;
+    if (!b.configured) {
+        return false;
+    }
+    if (cparams.moe_cache_size > 0) {
+        throw std::runtime_error("prefill borrow cannot be combined with the upstream MoE cache (moe_cache_size)");
+    }
+    if (cparams.kv_stream_arena_mib > 0 || kv_stream_phase_arena.configured) {
+        throw std::runtime_error("prefill borrow cannot be combined with the kv-stream arena in v1");
+    }
+    if (fork_mode == GGML_MOE_CACHE_MODE_OFF) {
+        LLAMA_LOG_INFO("%s: prefill borrow disabled: fork MoE slot cache is off\n", __func__);
+        return false;
+    }
+    if (model.n_devices() > 1 || cparams.pipeline_parallel) {
+        LLAMA_LOG_WARN("%s: prefill borrow disabled: multi-GPU is v2\n", __func__);
+        return false;
+    }
+    size_t cuda_index = SIZE_MAX;
+    ggml_backend_dev_t cuda_dev = nullptr;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (cuda_index != SIZE_MAX) {
+                LLAMA_LOG_WARN("%s: prefill borrow disabled: more than one GPU backend is v2\n", __func__);
+                return false;
+            }
+            cuda_index = i;
+            cuda_dev = ggml_backend_get_device(backend_ptrs[i]);
+        }
+    }
+    if (cuda_index == SIZE_MAX) {
+        LLAMA_LOG_INFO("%s: prefill borrow disabled: no GPU backend\n", __func__);
+        return false;
+    }
+    // Logical CUDA device: scan the registry like moe_cache_query_device does.
+    int logical = -1;
+    auto * reg = ggml_backend_dev_backend_reg(cuda_dev);
+    if (reg) {
+        const size_t count = ggml_backend_reg_dev_count(reg);
+        for (size_t index = 0; index < count; index++) {
+            if (ggml_backend_reg_dev_get(reg, index) == cuda_dev) {
+                logical = (int) index;
+                break;
+            }
+        }
+    }
+    if (logical < 0) {
+        LLAMA_LOG_WARN("%s: prefill borrow disabled: cannot map GPU backend to a CUDA device\n", __func__);
+        return false;
+    }
+    auto lend_fn        = (prefill_borrow_state::lend_fn_t)        ggml_backend_reg_get_proc_address(reg, "ggml_cuda_moe_cache_lend");
+    auto return_fn      = (prefill_borrow_state::return_fn_t)      ggml_backend_reg_get_proc_address(reg, "ggml_cuda_moe_cache_return");
+    auto buft_fn        = (prefill_borrow_state::buft_fn_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_borrowed_moe_buffer_type");
+    auto buft_free_fn   = (prefill_borrow_state::buft_free_fn_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_borrowed_moe_buffer_type_free");
+    auto graph_reset_fn = (prefill_borrow_state::graph_reset_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_reset");
+    if (!lend_fn || !return_fn || !buft_fn || !buft_free_fn || !graph_reset_fn) {
+        LLAMA_LOG_WARN("%s: prefill borrow disabled: CUDA backend predates the borrow API\n", __func__);
+        return false;
+    }
+    b.cuda_device = logical;
+    b.backend_index = cuda_index;
+    b.fork_mode = (enum llama_moe_cache_mode) fork_mode;
+    b.fork_budget_mib = cparams.moe_cache_budget_mib;
+    b.lend_fn = lend_fn;
+    b.return_fn = return_fn;
+    b.buft_fn = buft_fn;
+    b.buft_free_fn = buft_free_fn;
+    b.graph_reset_fn = graph_reset_fn;
+    b.eligible = true;
+    LLAMA_LOG_INFO("%s: prefill borrow armed on CUDA device %d (mode=%s, chunk=%s)\n", __func__, logical,
+        cparams.prefill_borrow_mib < 0 ? "auto" : "capped",
+        cparams.prefill_chunk_tokens == 0 ? "auto" : "capped");
+    return true;
+}
+
+void llama_context::prefill_borrow_normalize() {
+    auto & b = prefill_borrow;
+    if (!b.active && !b.normal_grown) {
+        return;
+    }
+    synchronize();
+    if (b.graph_reset_fn && b.backend_index < backend_ptrs.size()) {
+        b.graph_reset_fn(backend_ptrs[b.backend_index]);
+    }
+    sched.reset();
+    if (b.active) {
+        if (b.return_fn && !b.return_fn(b.cuda_device, b.loan_ptr)) {
+            LLAMA_LOG_ERROR("%s: prefill borrow loan return failed, slots stay loaned\n", __func__);
+        }
+        if (b.buft_free_fn) {
+            b.buft_free_fn(b.borrowed_buft);
+        }
+        if (b.backend_index < backend_buft.size() && b.saved_buft) {
+            backend_buft[b.backend_index] = b.saved_buft;
+        }
+        b.active = false;
+        b.borrowed_buft = nullptr;
+        b.saved_buft = nullptr;
+        b.loan_ptr = nullptr;
+        b.loan_bytes = 0;
+    }
+    b.normal_grown = false;
+}
+
+void llama_context::prefill_borrow_cleanup() {
+    prefill_borrow_normalize();
+}
+
+bool llama_context::prefill_borrow_enter(uint32_t n_tokens, const llama_memory_context_i * mctx) {
+    auto & b = prefill_borrow;
+    if (b.active || !b.eligible || mctx == nullptr) {
+        return false;
+    }
+    const uint32_t chunk_cap = cparams.prefill_chunk_tokens > 0
+        ? (uint32_t) cparams.prefill_chunk_tokens : 8192u;
+    const uint32_t chunk = std::min(n_tokens, chunk_cap);
+    if (chunk < n_tokens) {
+        // v1 runs the ubatch whole; splitting is v2. Caller grows normal.
+        LLAMA_LOG_INFO("%s: prompt ubatch %u exceeds v1 borrow chunk %u, normal path\n",
+            __func__, n_tokens, chunk);
+        return false;
+    }
+    const size_t want = cparams.prefill_borrow_mib > 0
+        ? (size_t) cparams.prefill_borrow_mib * 1024u * 1024u : 0; // 0 = auto
+    synchronize();
+    if (!b.graph_reset_fn(backend_ptrs[b.backend_index])) {
+        LLAMA_LOG_INFO("%s: graph reset failed, normal path\n", __func__);
+        return false;
+    }
+    void * ptr = nullptr;
+    const size_t lent = b.lend_fn(b.cuda_device, want, &ptr);
+    if (!lent || !ptr) {
+        LLAMA_LOG_INFO("%s: slab lend failed, normal path\n", __func__);
+        return false;
+    }
+    ggml_backend_buffer_type_t borrowed = b.buft_fn(b.cuda_device, ptr, lent);
+    if (!borrowed) {
+        b.return_fn(b.cuda_device, ptr);
+        return false;
+    }
+    b.saved_buft = backend_buft[b.backend_index];
+    backend_buft[b.backend_index] = borrowed;
+    b.borrowed_buft = borrowed;
+    b.loan_ptr = ptr;
+    b.loan_bytes = lent;
+    const uint32_t max_nodes = graph_max_nodes(chunk);
+    try {
+        prefill_borrow_new_sched(max_nodes);
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_WARN("%s: scheduler recreate failed (%s), normal path\n", __func__, ex.what());
+        backend_buft[b.backend_index] = b.saved_buft;
+        b.buft_free_fn(borrowed);
+        b.return_fn(b.cuda_device, ptr);
+        b.saved_buft = nullptr;
+        b.borrowed_buft = nullptr;
+        b.loan_ptr = nullptr;
+        b.loan_bytes = 0;
+        return false;
+    }
+    prefill_borrow_reset_graphs(max_nodes);
+    if (!prefill_borrow_reserve_graphs(chunk, mctx)) {
+        LLAMA_LOG_INFO("%s: borrowed reserve (%u tokens) failed, normal path\n", __func__, chunk);
+        sched.reset();
+        backend_buft[b.backend_index] = b.saved_buft;
+        b.buft_free_fn(borrowed);
+        b.return_fn(b.cuda_device, ptr);
+        b.saved_buft = nullptr;
+        b.borrowed_buft = nullptr;
+        b.loan_ptr = nullptr;
+        b.loan_bytes = 0;
+        return false;
+    }
+    prefill_borrow_refresh_sizes();
+    b.active = true;
+    LLAMA_LOG_INFO("%s: borrowing %zu MiB slab for %u prompt tokens\n", __func__, lent >> 20, chunk);
+    return true;
+}
+
+void llama_context::prefill_borrow_grow_normal(uint32_t n_tokens, const llama_memory_context_i * mctx) {
+    auto & b = prefill_borrow;
+    if (b.normal_grown) {
+        return;
+    }
+    const uint32_t max_nodes = graph_max_nodes(n_tokens);
+    prefill_borrow_new_sched(max_nodes);
+    prefill_borrow_reset_graphs(max_nodes);
+    if (!prefill_borrow_reserve_graphs(n_tokens, mctx)) {
+        throw std::runtime_error("prefill borrow fallback: failed to allocate compute buffers");
+    }
+    prefill_borrow_refresh_sizes();
+    b.normal_grown = true;
+    LLAMA_LOG_INFO("%s: prompt runs on transient normal buffers (%u tokens)\n", __func__, n_tokens);
+}
+
+void llama_context::prefill_borrow_shrink_to_decode(const llama_memory_context_i * mctx) {
+    auto & b = prefill_borrow;
+    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t max_nodes = graph_max_nodes(n_seqs);
+    prefill_borrow_new_sched(max_nodes);
+    prefill_borrow_reset_graphs(max_nodes);
+    if (graph_reserve(n_seqs, n_seqs, n_seqs, mctx) == nullptr) {
+        throw std::runtime_error("prefill borrow: failed to reserve decode buffers");
+    }
+    prefill_borrow_refresh_sizes();
+    b.normal_grown = false;
+    LLAMA_LOG_INFO("%s: decode buffers restored\n", __func__);
+}
+
+void llama_context::prefill_borrow_exit(const llama_memory_context_i * mctx) {
+    auto & b = prefill_borrow;
+    if (!b.active) {
+        return;
+    }
+    synchronize();
+    b.graph_reset_fn(backend_ptrs[b.backend_index]);
+    sched.reset();
+    if (!b.return_fn(b.cuda_device, b.loan_ptr)) {
+        LLAMA_LOG_ERROR("%s: prefill borrow loan return failed, slots stay loaned\n", __func__);
+    }
+    b.buft_free_fn(b.borrowed_buft);
+    backend_buft[b.backend_index] = b.saved_buft;
+    b.borrowed_buft = nullptr;
+    b.saved_buft = nullptr;
+    b.loan_ptr = nullptr;
+    b.loan_bytes = 0;
+    b.active = false;
+    prefill_borrow_shrink_to_decode(mctx);
+    LLAMA_LOG_INFO("%s: loan returned, decode buffers restored\n", __func__);
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
 
     sched_need_reserve = false;
+
+    // T10.3: drop any outstanding loan or transient prompt-size buffers before
+    // the full re-reserve rebuilds the scheduler below.
+    prefill_borrow_normalize();
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1196,6 +1479,11 @@ void llama_context::sched_reserve() {
     }
     LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n", __func__, moe_cache_requested,
                    moe_cache_eligible ? moe_cache_requested : "off");
+
+    // T10.3: resolve borrow eligibility now that the fork-cache mode is known.
+    // The startup reserve below stays full-size; the tail of this function
+    // shrinks it to decode size when eligible.
+    prefill_borrow_resolve(moe_cache_mode);
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                                        cparams.pipeline_parallel, cparams.op_offload));
@@ -1469,6 +1757,13 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n", __func__, (t_end_us - t_start_us) / 1000.0,
                    ggml_backend_sched_get_n_copies(sched.get()));
+
+    // T10.3: the reserve above is full prompt size so the startup log stays
+    // comparable; shrink to decode size when borrowing is eligible. Decode
+    // ubatches then run on small buffers until a prompt arrives.
+    if (prefill_borrow.eligible) {
+        prefill_borrow_shrink_to_decode(mctx.get());
+    }
 }
 
 void llama_context::synchronize() {
@@ -2391,6 +2686,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 return nullptr;
             }
             (void) active_target.cache->kv_stream_adapt(active_target.n_kv, ubatch.n_tokens);
+        }
+    }
+
+    // T10.3 prefill-borrow: prompts (>= 512 tokens) run on a scheduler backed
+    // by a lent fork-cache slab, decode ubatches on small normal buffers.
+    // Encoder ubatches carry no memory context; borrow stays out of their way.
+    if (prefill_borrow.eligible && mctx != nullptr) {
+        if (ubatch.n_tokens >= prefill_borrow_min_tokens) {
+            if (!prefill_borrow.active && !prefill_borrow.normal_grown) {
+                if (!prefill_borrow_enter(ubatch.n_tokens, mctx)) {
+                    prefill_borrow_grow_normal(ubatch.n_tokens, mctx);
+                }
+            }
+        } else {
+            if (prefill_borrow.active) {
+                prefill_borrow_exit(mctx);
+            } else if (prefill_borrow.normal_grown) {
+                prefill_borrow_shrink_to_decode(mctx);
+            }
         }
     }
 
@@ -4770,6 +5084,8 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_mode              =*/LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/0,
         /*.moe_cache_size              =*/0,
+        /*.prefill_borrow_mib          =*/0,
+        /*.prefill_chunk_tokens        =*/0,
         /*.abort_callback              =*/nullptr,
         /*.abort_callback_data         =*/nullptr,
         /*.embeddings                  =*/false,
@@ -4827,6 +5143,16 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
 
     if (params.moe_cache_size > 0 && params.moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON) {
         LLAMA_LOG_ERROR("%s: moe_cache_size (upstream expert cache) cannot be combined with moe_cache_mode=ON (fork slot cache)\n", __func__);
+        return nullptr;
+    }
+
+    // T10.3 prefill-borrow v1 scope guards (parse layer in common/arg.cpp; this covers direct C API use)
+    if (params.prefill_borrow_mib != 0 && params.moe_cache_size > 0) {
+        LLAMA_LOG_ERROR("%s: prefill_borrow_mib cannot be combined with moe_cache_size (upstream expert cache); v1 is fork slot cache only\n", __func__);
+        return nullptr;
+    }
+    if (params.prefill_borrow_mib != 0 && params.kv_stream_arena_mib > 0) {
+        LLAMA_LOG_ERROR("%s: prefill_borrow_mib cannot be combined with kv_stream_arena_mib in v1\n", __func__);
         return nullptr;
     }
 

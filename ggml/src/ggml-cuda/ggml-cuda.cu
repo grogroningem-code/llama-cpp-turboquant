@@ -809,6 +809,10 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     ggml_backend_cuda_phase_arena_t arena = nullptr;
+    // T10.3: false for wrappers over borrowed MoE-cache slab ranges, which
+    // must never reach cudaFree (interior pointers). Defaults true so every
+    // existing path keeps owning its allocation.
+    bool owns_memory = true;
     std::string name;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -1174,7 +1178,9 @@ static void ggml_backend_cuda_phase_arena_release(ggml_backend_cuda_phase_arena_
 
 ggml_backend_cuda_buffer_context::~ggml_backend_cuda_buffer_context() {
     if (arena == nullptr) {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owns_memory) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
         return;
     }
 
@@ -1283,6 +1289,86 @@ bool ggml_backend_cuda_phase_arena_set_compute(
 ggml_backend_buffer_type_t ggml_backend_cuda_phase_arena_buffer_type(
         ggml_backend_cuda_phase_arena_t arena) {
     return arena == nullptr ? nullptr : &arena->buffer_type;
+}
+
+// T10.3 prefill-borrow: buffer type over a lent MoE-cache slab range. The
+// range is owned by the cache loan, so buffers created here never free it
+// (owns_memory=false); the type object itself is owned by the borrower and
+// lives only for the duration of one loan.
+struct ggml_backend_cuda_borrowed_moe {
+    int device = -1;
+    void * ptr = nullptr;
+    size_t size = 0;
+    bool leased = false;
+    std::string name;
+};
+
+static const char * ggml_backend_cuda_borrowed_moe_get_name(ggml_backend_buffer_type_t buft) {
+    auto * loan = static_cast<ggml_backend_cuda_borrowed_moe *>(buft->context);
+    return loan->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_borrowed_moe_alloc(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    auto * loan = static_cast<ggml_backend_cuda_borrowed_moe *>(buft->context);
+    if (size == 0 || size > loan->size || loan->leased) {
+        return nullptr;
+    }
+    loan->leased = true;
+    auto * context = new ggml_backend_cuda_buffer_context(loan->device, loan->ptr);
+    context->owns_memory = false;
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, context, size);
+}
+
+static size_t ggml_backend_cuda_borrowed_moe_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return 128;
+}
+
+static size_t ggml_backend_cuda_borrowed_moe_alloc_size(
+        ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    auto * loan = static_cast<ggml_backend_cuda_borrowed_moe *>(buft->context);
+    return ggml_backend_cuda_buffer_type_get_alloc_size_for_device(loan->device, tensor);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_borrowed_moe_interface = {
+    /* .get_name         = */ ggml_backend_cuda_borrowed_moe_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_borrowed_moe_alloc,
+    /* .get_alignment    = */ ggml_backend_cuda_borrowed_moe_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ ggml_backend_cuda_borrowed_moe_alloc_size,
+    /* .is_host          = */ nullptr,
+};
+
+ggml_backend_buffer_type_t ggml_backend_cuda_borrowed_moe_buffer_type(int device, void * ptr, size_t size) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ptr || size == 0) {
+        return nullptr;
+    }
+    auto * loan = new (std::nothrow) ggml_backend_cuda_borrowed_moe();
+    if (!loan) {
+        return nullptr;
+    }
+    loan->device = device;
+    loan->ptr = ptr;
+    loan->size = size;
+    loan->name = GGML_CUDA_NAME "_Borrowed_MoE" + std::to_string(device);
+    ggml_backend_buffer_type_t buft = new (std::nothrow) ggml_backend_buffer_type();
+    if (!buft) {
+        delete loan;
+        return nullptr;
+    }
+    buft->iface = ggml_backend_cuda_borrowed_moe_interface;
+    buft->device = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device);
+    buft->context = loan;
+    return buft;
+}
+
+void ggml_backend_cuda_borrowed_moe_buffer_type_free(ggml_backend_buffer_type_t buft) {
+    if (!buft) {
+        return;
+    }
+    delete static_cast<ggml_backend_cuda_borrowed_moe *>(buft->context);
+    delete buft;
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -7498,6 +7584,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_graph_reset") == 0) {
         return (void *) ggml_backend_cuda_graph_reset;
+    }
+    if (strcmp(name, "ggml_backend_cuda_borrowed_moe_buffer_type") == 0) {
+        return (void *) ggml_backend_cuda_borrowed_moe_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_borrowed_moe_buffer_type_free") == 0) {
+        return (void *) ggml_backend_cuda_borrowed_moe_buffer_type_free;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_lend") == 0) {
+        return (void *) ggml_moe_cache_lend;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_return") == 0) {
+        return (void *) ggml_moe_cache_return;
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_supported") == 0) {
         return (void *) +[](ggml_type type_k, ggml_type type_v) {

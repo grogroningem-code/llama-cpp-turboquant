@@ -55,6 +55,8 @@ static constexpr int    moe_cache_pool_slots_min              = 64;
 static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
 static constexpr int    moe_cache_node_rows_max               = 64;
 static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
+// T10.3: smallest loan worth the scheduler re-reserve + graph-reset cost.
+static constexpr size_t moe_cache_loan_bytes_min              = 128u << 20;
 
 // Adaptive cpu-overlap calibration (see moe_cache_calibration_on_enter/leave):
 // only runs while overlap_cpu_rows is left automatic. Candidate -1 means
@@ -81,6 +83,10 @@ enum class moe_cache_slot_state : uint8_t {
     free,
     copying,
     valid,
+    // Lent to the T10.3 prefill-borrow path: excluded from free_slots, the
+    // LRU chain, the key map, admission, dispatch and trim. Never freed,
+    // never filled while loaned; return restores free.
+    loaned,
 };
 
 struct moe_cache_key {
@@ -121,6 +127,12 @@ struct moe_cache_pool {
     char * slab = nullptr;
     int n_slots = 0;
     bool covers_all_entries = false;
+
+    // Outstanding T10.3 loan: contiguous run [loan_start, loan_start+n).
+    // -1/0 = no loan in this pool. Guarded by the session mutex (+ dispatch
+    // mutex at lend/return time, same order as trim).
+    int loan_start = -1;
+    int loan_nslots = 0;
 
     std::vector<moe_cache_slot> slots;
     std::vector<int> free_slots;
@@ -224,6 +236,11 @@ struct moe_cache_device {
     const void * inflight_source = nullptr;
     size_t inflight_bytes = 0;
     std::thread worker;
+
+    // Outstanding T10.3 loan (at most one per device: no concurrent prompts).
+    // loan_pool indexes pools; the range lives in that pool's loan fields.
+    bool loan_active = false;
+    int loan_pool = -1;
 
     cudaStream_t compute_stream = nullptr;
     char * h_input = nullptr;
@@ -810,6 +827,11 @@ static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
 
 static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_free) {
     moe_cache_slot & slot = pool.slots[index];
+    if (slot.state == moe_cache_slot_state::loaned) {
+        // Loaned ranges are owned by the T10.3 borrower until return; no
+        // cache path may recycle them (see the invalidate guard below).
+        return;
+    }
     if (slot.state == moe_cache_slot_state::valid) {
         moe_cache_lru_remove(pool, index);
     }
@@ -1708,13 +1730,23 @@ static void moe_cache_cancel_queue_locked(
     }
 }
 
-static void moe_cache_free_device(moe_cache_device & device) {
+static void moe_cache_free_device(moe_cache_device & device, int spare_pool = -1) {
     ggml_cuda_set_device(device.logical);
     if (device.compute_stream) {
         (void)cudaStreamSynchronize(device.compute_stream);
     }
+    // T10.3: trim spares the pool hosting an outstanding prefill loan; its
+    // slab cannot be partially freed (single cudaMalloc), so the whole pool
+    // survives while everything else is surrendered.
+    std::unique_ptr<moe_cache_pool> spared;
+    size_t spared_bytes = 0;
+    if (spare_pool >= 0 && spare_pool < (int) device.pools.size() &&
+            device.pools[spare_pool] && device.pools[spare_pool]->slab) {
+        spared = std::move(device.pools[spare_pool]);
+        spared_bytes = (size_t) spared->n_slots * spared->expert_size;
+    }
     for (auto & pool_ptr : device.pools) {
-        if (pool_ptr->slab) {
+        if (pool_ptr && pool_ptr->slab) {
             (void)cudaFree(pool_ptr->slab);
             moe_cache_budget_allocation(
                     device, (size_t)pool_ptr->n_slots * pool_ptr->expert_size, false);
@@ -1749,7 +1781,16 @@ static void moe_cache_free_device(moe_cache_device & device) {
         device.compute_stream = nullptr;
     }
     device.pools.clear();
-    device.allocated_bytes = 0;
+    if (spared) {
+        // The spared pool becomes the only pool; fix the loan index.
+        device.pools.push_back(std::move(spared));
+        device.allocated_bytes = spared_bytes;
+        if (device.loan_active) {
+            device.loan_pool = 0;
+        }
+    } else {
+        device.allocated_bytes = 0;
+    }
     device.d_input_cap = 0;
     device.act_q8_cap = 0;
     device.d_out_cap = 0;
@@ -2411,6 +2452,9 @@ static int moe_cache_lookup_or_queue_locked(
         int fallback = -1;
         for (int c = pool.lru_head; c >= 0; c = pool.slots[c].next) {
             moe_cache_slot & s = pool.slots[c];
+            if (s.state == moe_cache_slot_state::loaned) {
+                continue;
+            }
             if (s.readers > 0) {
                 continue;
             }
@@ -3241,6 +3285,7 @@ static void moe_cache_invalidate_session(
                         (size_t)slot.key.expert * pool.expert_size
                     : nullptr;
                 if (slot.state != moe_cache_slot_state::free &&
+                    slot.state != moe_cache_slot_state::loaned &&
                     moe_cache_ranges_overlap(source, pool.expert_size, base, size)) {
                     moe_cache_slot_reset(pool, index, true);
                 }
@@ -3298,6 +3343,291 @@ static void moe_cache_invalidate(const void * base, size_t size) {
     }
 }
 
+// T10.3 prefill-borrow: lend contiguous whole-slot slab runs as prompt
+// compute scratch, returned before decode. All helpers assume the session
+// mutex is held; lend/return entry points additionally hold the dispatch
+// mutex (same order as trim: dispatch first, then session).
+static bool moe_cache_loan_slot_evictable(const moe_cache_slot & slot) {
+    if (slot.state == moe_cache_slot_state::free) {
+        return true;
+    }
+    if (slot.state != moe_cache_slot_state::valid) {
+        return false;
+    }
+    return slot.readers == 0;
+}
+
+// Shortest free-only run with at least nslots, or -1 (best fit).
+static int moe_cache_loan_find_free_run(moe_cache_pool & pool, int nslots) {
+    int best_start = -1;
+    int best_len = INT_MAX;
+    int run_start = -1;
+    int run_len = 0;
+    for (int index = 0; index <= pool.n_slots; index++) {
+        const bool free_slot =
+            index < pool.n_slots && pool.slots[index].state == moe_cache_slot_state::free;
+        if (free_slot) {
+            if (run_start < 0) {
+                run_start = index;
+                run_len = 0;
+            }
+            run_len++;
+        } else {
+            if (run_start >= 0 && run_len >= nslots && run_len < best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_start = -1;
+            run_len = 0;
+        }
+    }
+    return best_start;
+}
+
+// First window of nslots where every slot is free or evictable, or -1.
+static int moe_cache_loan_find_evict_run(moe_cache_pool & pool, int nslots) {
+    if (nslots > pool.n_slots) {
+        return -1;
+    }
+    for (int start = 0; start + nslots <= pool.n_slots; start++) {
+        bool ok = true;
+        for (int index = start; index < start + nslots; index++) {
+            if (!moe_cache_loan_slot_evictable(pool.slots[index])) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            return start;
+        }
+    }
+    return -1;
+}
+
+static size_t moe_cache_loan_free_bytes(moe_cache_pool & pool) {
+    size_t free_count = 0;
+    for (int index = 0; index < pool.n_slots; index++) {
+        if (pool.slots[index].state == moe_cache_slot_state::free) {
+            free_count++;
+        }
+    }
+    return free_count * pool.expert_size;
+}
+
+static void moe_cache_loan_free_slots_erase(moe_cache_pool & pool, int start, int nslots) {
+    auto & free_slots = pool.free_slots;
+    free_slots.erase(
+        std::remove_if(free_slots.begin(), free_slots.end(), [&](int index) {
+            return index >= start && index < start + nslots;
+        }),
+        free_slots.end());
+}
+
+// Carve [start, start+nslots) out of the pool. Evicts residents (their
+// entries are dropped from map+LRU; decode re-loads on resume). Prompt and
+// decode never overlap, so eviction is safe. Returns the slab sub-range.
+static void * moe_cache_loan_carve_locked(
+        moe_cache_device & device, int pool_index, int start, int nslots) {
+    moe_cache_pool & pool = *device.pools[pool_index];
+    for (int index = start; index < start + nslots; index++) {
+        moe_cache_slot & slot = pool.slots[index];
+        if (slot.state == moe_cache_slot_state::valid) {
+            moe_cache_slot_reset(pool, index, false);
+            device.evictions++;
+        } else if (slot.state != moe_cache_slot_state::free) {
+            return nullptr;
+        }
+        slot.key = {};
+        slot.generation++;
+        slot.readers = 0;
+        slot.uses = 0;
+        slot.prev = -1;
+        slot.next = -1;
+        slot.state = moe_cache_slot_state::loaned;
+    }
+    moe_cache_loan_free_slots_erase(pool, start, nslots);
+    pool.loan_start = start;
+    pool.loan_nslots = nslots;
+    device.loan_active = true;
+    device.loan_pool = pool_index;
+    return pool.slab + (size_t) start * pool.expert_size;
+}
+
+static size_t moe_cache_lend_locked(
+        moe_cache_session & session, moe_cache_device & device, size_t bytes, void ** out_ptr) {
+    if (device.loan_active || device.dead.load() || session.stopping || session.dormant) {
+        return 0;
+    }
+    size_t want = bytes;
+    if (want == 0) {
+        // auto: half of the largest pool's free bytes.
+        size_t best_free = 0;
+        for (const auto & pool_ptr : device.pools) {
+            if (pool_ptr->slab) {
+                best_free = std::max(best_free, moe_cache_loan_free_bytes(*pool_ptr));
+            }
+        }
+        want = best_free / 2;
+    }
+    if (want < moe_cache_loan_bytes_min) {
+        return 0;
+    }
+    // Pass 1: best-fit free-only run. Pass 2: evict-window run.
+    for (int pass = 0; pass < 2; pass++) {
+        int best_pool = -1;
+        int best_start = -1;
+        int best_waste = INT_MAX;
+        for (int pool_index = 0; pool_index < (int) device.pools.size(); pool_index++) {
+            moe_cache_pool & pool = *device.pools[pool_index];
+            if (!pool.slab || pool.expert_size == 0) {
+                continue;
+            }
+            const int need = (int) ((want + pool.expert_size - 1) / pool.expert_size);
+            if (need <= 0 || need > pool.n_slots) {
+                continue;
+            }
+            int start = -1;
+            if (pass == 0) {
+                start = moe_cache_loan_find_free_run(pool, need);
+            } else {
+                start = moe_cache_loan_find_evict_run(pool, need);
+            }
+            if (start < 0) {
+                continue;
+            }
+            // Prefer the tightest fit so big runs survive for later prompts.
+            int run_len = 0;
+            while (start + run_len < pool.n_slots &&
+                    (pass == 0 ? pool.slots[start + run_len].state == moe_cache_slot_state::free
+                               : moe_cache_loan_slot_evictable(pool.slots[start + run_len]))) {
+                run_len++;
+            }
+            const int waste = run_len - need;
+            if (waste < best_waste) {
+                best_waste = waste;
+                best_pool = pool_index;
+                best_start = start;
+            }
+        }
+        if (best_pool >= 0) {
+            moe_cache_pool & pool = *device.pools[best_pool];
+            const int need = (int) ((want + pool.expert_size - 1) / pool.expert_size);
+            void * ptr = moe_cache_loan_carve_locked(device, best_pool, best_start, need);
+            if (ptr) {
+                *out_ptr = ptr;
+                const size_t lent = (size_t) need * pool.expert_size;
+                MOE_CACHE_LOG("[moe-cache] CUDA%d lent %zu MiB slab (%d slots, pool %d, %s) for prefill borrow\n",
+                        device.physical, lent >> 20, need, best_pool, pass == 0 ? "free" : "evicted");
+                return lent;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static bool moe_cache_return_locked(
+        moe_cache_session & session, moe_cache_device & device, void * ptr) {
+    (void) session;
+    if (!device.loan_active || !ptr) {
+        return false;
+    }
+    if (device.loan_pool < 0 || device.loan_pool >= (int) device.pools.size()) {
+        return false;
+    }
+    moe_cache_pool & pool = *device.pools[device.loan_pool];
+    if (!pool.slab || pool.loan_start < 0 || pool.loan_nslots <= 0) {
+        return false;
+    }
+    void * expect = pool.slab + (size_t) pool.loan_start * pool.expert_size;
+    if (expect != ptr) {
+        return false;
+    }
+    for (int index = pool.loan_start; index < pool.loan_start + pool.loan_nslots; index++) {
+        if (pool.slots[index].state != moe_cache_slot_state::loaned) {
+            // Corrupt loan; refuse rather than disturb cache accounting.
+            return false;
+        }
+    }
+    for (int index = pool.loan_start; index < pool.loan_start + pool.loan_nslots; index++) {
+        moe_cache_slot & slot = pool.slots[index];
+        slot.key = {};
+        slot.generation++;
+        slot.readers = 0;
+        slot.uses = 0;
+        slot.prev = -1;
+        slot.next = -1;
+        slot.state = moe_cache_slot_state::free;
+        pool.free_slots.push_back(index);
+    }
+    const size_t lent = (size_t) pool.loan_nslots * pool.expert_size;
+    pool.loan_start = -1;
+    pool.loan_nslots = 0;
+    device.loan_active = false;
+    device.loan_pool = -1;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d returned %zu MiB slab prefill loan\n",
+            device.physical, lent >> 20);
+    return true;
+}
+
+extern "C" size_t ggml_moe_cache_lend(int device, size_t bytes, void ** out_ptr) {
+    if (!out_ptr) {
+        return 0;
+    }
+    *out_ptr = nullptr;
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return 0;
+    }
+    const int physical_device = info.devices[device].physical_device;
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        for (auto & device_ptr : session->devices) {
+            if (device_ptr->physical != physical_device) {
+                continue;
+            }
+            std::unique_lock<std::mutex> dispatch_lock(device_ptr->dispatch_mu);
+            std::unique_lock<std::mutex> lock(session->mu);
+            const size_t lent = moe_cache_lend_locked(*session, *device_ptr, bytes, out_ptr);
+            if (lent > 0) {
+                return lent;
+            }
+        }
+    }
+    return 0;
+}
+
+extern "C" bool ggml_moe_cache_return(int device, void * ptr) {
+    if (!ptr) {
+        return false;
+    }
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+    const int physical_device = info.devices[device].physical_device;
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        for (auto & device_ptr : session->devices) {
+            if (device_ptr->physical != physical_device) {
+                continue;
+            }
+            std::unique_lock<std::mutex> dispatch_lock(device_ptr->dispatch_mu);
+            std::unique_lock<std::mutex> lock(session->mu);
+            if (moe_cache_return_locked(*session, *device_ptr, ptr)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device) {
     moe_cache_device * selected = nullptr;
@@ -3321,15 +3651,21 @@ static size_t moe_cache_trim_session(
     });
 
     size_t freed = 0;
-    for (const auto & pool_ptr : selected->pools) {
-        if (pool_ptr->slab) {
+    // T10.3: a pool hosting an outstanding prefill loan cannot be partially
+    // freed (single cudaMalloc per slab) - skip it, free everything else.
+    const int spare_pool =
+        (selected->loan_active && selected->loan_pool >= 0 &&
+         selected->loan_pool < (int) selected->pools.size()) ? selected->loan_pool : -1;
+    for (int pool_index = 0; pool_index < (int) selected->pools.size(); pool_index++) {
+        const auto & pool_ptr = selected->pools[pool_index];
+        if (pool_ptr->slab && pool_index != spare_pool) {
             freed += (size_t)pool_ptr->n_slots * pool_ptr->expert_size;
         }
     }
     freed += selected->d_out_cap + selected->d_input_cap +
              selected->act_q8_cap;
     lock.unlock();
-    moe_cache_free_device(*selected);
+    moe_cache_free_device(*selected, spare_pool);
     moe_cache_budget_unregister(*selected);
 
     if (freed > 0) {

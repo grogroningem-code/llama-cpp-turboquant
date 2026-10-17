@@ -406,6 +406,9 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
+        int prefill_borrow_mib;  // T10.3: 0 = off, -1 = auto, >0 = MiB of fork MoE slot-cache slab to borrow for prompt compute [EXPERIMENTAL]
+        int prefill_chunk_tokens; // T10.3: 0 = auto (min(ubatch, 8192)), >0 = tokens used for borrow sizing [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

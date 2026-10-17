@@ -12,6 +12,8 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include "../ggml/src/ggml-backend-moe-cache.h"
+
 #include <array>
 #include <map>
 #include <vector>
@@ -353,6 +355,55 @@ private:
 
     // Declared before memory and scheduler so their arena leases are released first.
     kv_stream_phase_arena_owner kv_stream_phase_arena;
+
+    // T10.3 prefill-borrow: independent phase state machine over fork
+    // MoE-cache slab loans (DESIGN-T10.3.md sections 8-9). Transitions
+    // destroy and re-create sched, so this must outlive it.
+    struct prefill_borrow_state {
+        using lend_fn_t        = size_t (*)(int, size_t, void **);
+        using return_fn_t      = bool (*)(int, void *);
+        using buft_fn_t        = ggml_backend_buffer_type_t (*)(int, void *, size_t);
+        using buft_free_fn_t   = void (*)(ggml_backend_buffer_type_t);
+        using graph_reset_fn_t = bool (*)(ggml_backend_t);
+
+        bool configured = false;   // requested via cparams (flag)
+        bool eligible = false;     // resolved: single CUDA GPU + fork cache, no upstream/arena
+        bool active = false;       // borrowed scheduler installed, loan outstanding
+        bool normal_grown = false; // fallback: normal scheduler at prompt size
+
+        int cuda_device = -1;              // logical CUDA device for lend/return
+        size_t backend_index = SIZE_MAX;   // index into backend_ptrs/backend_buft
+        ggml_backend_buffer_type_t saved_buft = nullptr;
+        ggml_backend_buffer_type_t borrowed_buft = nullptr;
+        void * loan_ptr = nullptr;
+        size_t loan_bytes = 0;
+
+        enum llama_moe_cache_mode fork_mode = LLAMA_MOE_CACHE_MODE_OFF;
+        size_t fork_budget_mib = 0;
+
+        lend_fn_t lend_fn = nullptr;
+        return_fn_t return_fn = nullptr;
+        buft_fn_t buft_fn = nullptr;
+        buft_free_fn_t buft_free_fn = nullptr;
+        graph_reset_fn_t graph_reset_fn = nullptr;
+    };
+
+    prefill_borrow_state prefill_borrow;
+
+    // Resolve eligibility after the fork-cache mode is known. Returns true
+    // when the startup reserve should shrink to decode size afterwards.
+    bool prefill_borrow_resolve(ggml_moe_cache_mode fork_mode);
+    // Drop any loan/grown state before a full re-reserve (best effort).
+    void prefill_borrow_normalize();
+    void prefill_borrow_reset_graphs(uint32_t max_nodes);
+    void prefill_borrow_refresh_sizes();
+    void prefill_borrow_new_sched(uint32_t max_nodes);
+    bool prefill_borrow_reserve_graphs(uint32_t chunk_tokens, const llama_memory_context_i * mctx);
+    bool prefill_borrow_enter(uint32_t n_tokens, const llama_memory_context_i * mctx);
+    void prefill_borrow_grow_normal(uint32_t n_tokens, const llama_memory_context_i * mctx);
+    void prefill_borrow_exit(const llama_memory_context_i * mctx);
+    void prefill_borrow_shrink_to_decode(const llama_memory_context_i * mctx);
+    void prefill_borrow_cleanup();
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

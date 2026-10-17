@@ -26,6 +26,9 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
+    int prefill_borrow_mib;   // 0 = off, -1 = auto, >0 = MiB cap
+    int prefill_chunk_tokens; // 0 = auto, >0 = sizing cap in tokens
+
     float rope_freq_base;
     float rope_freq_scale;
 

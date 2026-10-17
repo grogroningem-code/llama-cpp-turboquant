@@ -45,6 +45,15 @@ GGML_BACKEND_API bool ggml_backend_cuda_phase_arena_set_compute(
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_phase_arena_buffer_type(
     ggml_backend_cuda_phase_arena_t arena);
 
+// T10.3 prefill-borrow: buffer type over a lent MoE-cache slab range (never
+// owned; the loan outlives the type object). The caller frees the type with
+// ggml_backend_cuda_borrowed_moe_buffer_type_free after the scheduler that
+// used it is destroyed.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_borrowed_moe_buffer_type(
+    int device, void * ptr, size_t size);
+GGML_BACKEND_API void ggml_backend_cuda_borrowed_moe_buffer_type_free(
+    ggml_backend_buffer_type_t buft);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

@@ -1732,6 +1732,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_size = params.moe_cache_size;
 
+    cparams.prefill_borrow_mib   = params.prefill_borrow_mib;
+    cparams.prefill_chunk_tokens = params.prefill_chunk_tokens;
+
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
             case COMMON_MOE_CACHE_MODE_OFF:

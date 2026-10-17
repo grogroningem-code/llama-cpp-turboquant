@@ -619,6 +619,9 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU
 
+    int prefill_borrow_mib = 0;   // T10.3: 0 = off, -1 = auto, >0 = MiB cap
+    int prefill_chunk_tokens = 0; // T10.3: 0 = auto, >0 = sizing cap in tokens
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

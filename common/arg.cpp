@@ -1279,6 +1279,14 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             throw std::invalid_argument("error: --moe-cache-mib cannot be combined with --moe-cache <mode>; pass --moe-cache off to use the upstream expert cache");
         }
 
+        // T10.3 prefill-borrow v1 scope: fork slot cache only, no kv-stream arena
+        if (params.prefill_borrow_mib != 0 && params.moe_cache_size > 0) {
+            throw std::invalid_argument("error: --prefill-borrow cannot be combined with --moe-cache-mib; prefill borrowing is v1 fork --moe-cache only");
+        }
+        if (params.prefill_borrow_mib != 0 && params.kv_stream_arena_mib > 0) {
+            throw std::invalid_argument("error: --prefill-borrow cannot be combined with --kv-stream-arena-mib in v1");
+        }
+
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2749,6 +2757,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_size = (size_t) value*1024*1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--prefill-borrow"}, "off|auto|N",
+        "borrow N MiB (or 'auto' = half the largest MoE slot-cache pool) of GPU expert-cache slab for prompt compute buffers, returned before decode (default: off; v1: fork --moe-cache only, single GPU, no --moe-cache-mib, no --kv-stream-arena-mib) [EXPERIMENTAL]",
+        [](common_params & params, const std::string & value) {
+            if (value == "off" || value == "0") {
+                params.prefill_borrow_mib = 0;
+            } else if (value == "auto") {
+                params.prefill_borrow_mib = -1;
+            } else {
+                char * end = nullptr;
+                errno = 0;
+                const long long borrow_mb = strtoll(value.c_str(), &end, 10);
+                if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                    borrow_mb <= 0 || borrow_mb > 1024 * 1024) {
+                    throw std::invalid_argument("expected off, auto, or a positive MiB budget");
+                }
+                params.prefill_borrow_mib = (int) borrow_mb;
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFILL_BORROW"));
+    add_opt(common_arg(
+        {"--prefill-chunk"}, "auto|N",
+        "prompt tokens used for prefill-borrow sizing (default: auto = min(ubatch, 8192); ubatch splitting is v2) [EXPERIMENTAL]",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.prefill_chunk_tokens = 0;
+            } else {
+                char * end = nullptr;
+                errno = 0;
+                const long long chunk = strtoll(value.c_str(), &end, 10);
+                if (errno != 0 || end == value.c_str() || *end != '\0' || chunk <= 0 || chunk > 1024 * 1024) {
+                    throw std::invalid_argument("expected auto or a positive token count");
+                }
+                params.prefill_chunk_tokens = (int) chunk;
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFILL_CHUNK"));
     add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
