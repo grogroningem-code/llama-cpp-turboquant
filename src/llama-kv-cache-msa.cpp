@@ -43,8 +43,13 @@ llama_kv_cache_msa::llama_kv_cache_msa(
 
     LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+    // the indexer reads keys with GET_ROWS and needs raw values, but turbo dequant keeps the WHT rotation, so use q8_0 there
+    const auto idx_type = [](ggml_type t) {
+        return (t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0) ? GGML_TYPE_Q8_0 : t;
+    };
+
     kv_idx = std::make_unique<llama_kv_cache>(
-            model, hparams_idx, type_k, type_v,
+            model, hparams_idx, idx_type(type_k), idx_type(type_v),
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
             n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
 }
