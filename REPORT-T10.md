@@ -500,3 +500,171 @@ Written at repo root. Key findings from reading (not assumptions):
 Commits on t11-qwen4exp (no push): T12.1 fix + tests, T12.2 fix + logs,
 DESIGN-T12.3.md, this report section. Scratch under cache/scratch/ left
 untracked and uncommitted.
+
+# T13 (t13-qwen4exp-resync): full qwen4exp re-sync to upstream #29751
+
+Branch `t13-qwen4exp-resync` from `t11-qwen4exp` at `f5fb9f3c7`
+(no report commit `072f5baf3`; no push). Target: upstream `56a33d691`
+"llama: fix qwen4exp" + `f2ef14ea8` "qwen4exp: keep kq_mask input the same
+shape" (= `66e0c17ee` "llama: fix qwen4exp (#29751)"). Plan (with import
+order, skip reasons, survival checklist, maintainer greedy commands):
+RESYNC-T13.md (T13.0). T11.1's verdict stands: a hunk port was impossible,
+the fork predates even the pre-fix parent `552f18f91` and lacked the whole
+k-pool stack (`build_inp_kpool`, `build_qsa_sel`, `llm_graph_input_kpool`,
+`indexer_kpool_row/by_order`, hparams `indexer_kpool*`, `kpool_layout/state/
+access`, `set_input_kpool` from #27773/`649dcb103`).
+
+Commits (all `user.name=hermes-agent`, no push):
+
+- `dba1149f4` T13.0: RESYNC-T13.md plan (227 lines).
+- `2b49ea71a` T13.1: `ed7ac35e1` causal_attn, no scheduler re-reserve + QSA
+  causal rule. Gates: shared build green; test-arg-parser all OK
+  (2026-10-17); test-backend-ops MUL_MAT_ID exit 0.
+- `4ca2c9268` T13.2: k-pool base - `649dcb103` memory parts (kpool_layout/
+  state/access, stale tracking, layout_update, build_sizes/state,
+  set_input_kpool, gather_mla_rows, full-context ns_ubatch/ctx_idx restore)
+  + `b356fa262` cells index (`seq_pos` map->set-of-pairs, `seq_pos_get`)
+  + `get_n_seq_max`/`get_stream` (introduced by 649 itself) +
+  `indexer_kpool`/`select_tail` hparams + MLA q-view stride fix
+  (`nb[2]*(ne[2]/n_stream)`). Gates: shared build green; test-arg-parser
+  all OK; MUL_MAT_ID 981/981 CUDA0 OK.
+- `2776585af` T13.3: `10f340d1a` re-enable -sm tensor for qwen4exp (#28569:
+  `ggml_build_forward_expand(gf, res_hc)` + drop QWEN4EXP from the
+  `llm_arch_supports_sm_tensor` exclusion). Gates: shared build green;
+  test-arg-parser all OK.
+- `a5db4cda9` T13.4: `56a33d691` (#29751). Model side: kpool derivation from
+  compress ratios, shared `llm_graph_input_kpool`, `build_qsa_top_k` ->
+  `build_qsa_sel`, `build_attn_qsa(sel, n_sel)`; memory side: by_order scan,
+  `kpool_rank`, `n_new_g`, `new_pool_pos`, both `set_input_qsa` deleted.
+  Gates: shared build green FIRST TRY; test-arg-parser all OK;
+  MUL_MAT_ID pass (CUDA0 + CPU).
+- `56633f3e8` T13.5: `f2ef14ea8` (sel keeps kq_mask 4D shape, 4+/2-
+  verbatim). Gates: shared build green (llama.dll 00:46); test-arg-parser
+  all OK; MUL_MAT_ID pass; static build reconfigured + rebuilt,
+  test-llama-archs.exe fresh 01:04.
+- `3ef66d734` T13.6: fidelity fixes from the `66e0c17ee` cross-check (R9:
+  drop shadowing `n_kv` local in `can_reuse`, comment + blank line).
+  Gates: shared build green (llama.dll relinked 02:09); test-arg-parser
+  100% (ctest -C Release); MUL_MAT_ID pass (CUDA0 + CPU);
+  `-o LIGHTNING_INDEXER` 96/96 pass, CUDA0 OK.
+
+Remaining gates: test-llama-archs full matrix (static; process exited -
+result UNCONFIRMED, see Verify manually); `-o FLASH_ATTN_EXT` full sweep
+(process exited after ~70 min - result UNCONFIRMED).
+
+## Resolved conflicts (each)
+
+- R1 (T13.1, `ed7ac35e1`): cherry-pick hit `<<<<<<<` markers in
+  hybrid-idx.h/.cpp. Kept fork `[TAG_PLE_HISTORY]` + `ple_hist_get` decl;
+  dropped the duplicated upstream `set_input_qsa` decl and the duplicated
+  upstream `llama_memory_hybrid_idx_ns` + context-ctor block. Verified
+  `grep` markers empty before `add` + `cherry-pick --quit`.
+- R2 (T13.2): upstream moved the QSA body to memory-level `set_input_qsa`
+  (649) but the fork had consolidated it into context-level `set_input_qsa`
+  (T11.x). Kept the fork consolidation; ported only the k-pool additions.
+  Upstream's memory-level fn was never added (nothing to consolidate into).
+- R3 (T13.2): fork lacks `state_clear` (upstream `08618ff8e` #27530, NOT
+  imported - failed-restore zeroing, out of scope). `state_drop` keeps
+  fork's `seq_rm(-1,-1)` calls + adds only the stale hooks (deviation D2).
+- R4 (T13.2): upstream `b356fa262` also adds `seq_pos_tok_le` +
+  `cells.ext.tok` + n-gram `get_prev_tokens` removal. Skipped the token
+  half (deviation D1): fork deleted the only consumer (n-gram speculative
+  path) in favor of its own PLE history; re-adding `ext.tok` writes would
+  touch kv-cache hot paths for no T13 consumer (`tok_le` unused by 649's
+  kpool and by #29751 - verified by grep on both diffs).
+- R5 (T13.3): `llama-arch.cpp` surrounding cases differ (fork has
+  KIMI_LINEAR where upstream has GLM5_NEXT) - same one-line QWEN4EXP drop.
+- R6 (T13.4): fork `llm_graph_input_qsa` lives at file scope, upstream
+  in-struct. Renamed at file scope (`models.h:2135` fwd decl + qwen4exp.cpp
+  class); `build_inp_kpool` follows fork style (returns raw pointer from
+  `res->add_input`, no cast).
+- R7 (T13.4): fork `build_qsa_top_k` was byte-identical to upstream pre-56a
+  (no fork scoring customizations - T11.4's tile kernel lives in
+  `ggml/src/ggml-cuda/lightning-indexer.cu`, used by the generic build_attn
+  path), so it was replaced wholesale by `build_qsa_sel`. Fork blocks that
+  DO live in `build_attn_qsa` (turbo-WHT Q rotation, norm-vs-plain fork,
+  sparse-FA `n_kv_max`) sit after the replaced mask-build region and were
+  kept verbatim; only the count arg changed (`top_k->ne[0]` -> `n_sel`).
+- R8 (T13.4): 321-line dead fork `set_input_qsa` body deleted from
+  hybrid-idx.cpp (lines 897-1217, CRLF preserved, verified `-359` in
+  diffstat + clean seam) + decl removed from the header. Zero remaining
+  `set_input_qsa` references in `src/`.
+- Plan deviations: models.h qsa->kpool renames landed in T13.4 (not T13.2,
+  they belong to #29751); `glm5-next.cpp` NOT imported (per plan);
+  `37b53fd45` fused_dsv4_hc NOT imported (per plan, #29751 needs none of
+  it); T13.2 memory `get_kpool()` is hparams-driven inline (no extra fork
+  rule needed for pooled rows - the T10.0 q8_0 lambda maps whole rows).
+- R9 (post-T13.5 cross-check vs squash-merge `66e0c17ee`): T13.4 had added
+  `const int64_t n_kv = idx->get_n_kv();` in `can_reuse` from a misread of
+  the demoted 56a hunk - upstream never had it (the member `n_kv` is the
+  comparison; the local shadowed it into a dead always-true check). Removed
+  in T13.6. Same cross-check fixed a stale comment (glm5-next -> glm5-next,
+  qwen4exp QSA) and a missing blank line in `kpool_build_state`. Method:
+  `git diff 66e0c17ee -- <file>` (working tree, NOT `HEAD` - the latter hid
+  uncommitted fixes) hunk-scan; every remaining hunk matches a known fork
+  block or pre-existing drift (verified identical hunks in
+  `git diff 66e0c17ee f5fb9f3c7`).
+- Gate hygiene: `test-arg-parser.exe` run directly prints usage errors as
+  part of its PASSING invalid-usage subtests - judge by exit code / final
+  "all tests OK" line, or `ctest --test-dir build-cuda -C Release
+  -R "^test-arg-parser$"` (multi-config needs `-C`; bare ctest reports
+  "Not Run"). Never run a second GPU job while one holds the build DLLs:
+  link fails LNK1104 on locked `ggml-base.dll` (hit once: rebuild queued
+  behind the FLASH_ATTN_EXT sweep).
+
+## Fork behaviour that survived (each checked)
+
+`git diff f5fb9f3c7..HEAD --name-only`: exactly 11 src files
+(arch, context, graph, hparams, kv-cache.* , kv-cells.h, hybrid-idx.*,
+models.h, qwen4exp.cpp) + RESYNC-T13.md. `ggml/` untouched (T11.4 tile
+kernel, T12.1 turbo WHT/sparse kernels, T11.3 CUDA picker intact);
+`llama-graph.cpp` delta is ONLY the 649 stream-view fix.
+
+- (a) MTP/NextN head: 87 mtp/nextn matches, `graph_mtp` (l.544) intact;
+  upstream MTP (#29761, out of range) not imported.
+- (b) PLE history: `build_ple`, ple_hist_get/put, serialise paths intact.
+- (c) LAZY `per_layer_tok_embd` + prefetch gate: 11 ple/prefetch/LAZY
+  matches intact; #29599 verbatim not re-imported (per plan row 11).
+- (d) q8_0 indexer rule (T10.0): `idx_type` lambda (hybrid-idx.cpp:67)
+  intact; applies to whole k rows incl. pooled slots (row-granular).
+- (e) Turbo-WHT Q rotation (T12.1): TURBO branch + `ggml_turbo_wht`
+  forward call (qwen4exp.cpp:1063-1070) intact in the new QSA path.
+- (f) Sparse FA gather (T11.3): `build_attn_mha(..., n_sel, ...)` non-zero
+  budget intact; `-o FLASH_ATTN_EXT` full sweep exited after ~70 min,
+  result UNCONFIRMED (see Verify manually item 1).
+- (g) Tiled lightning indexer (T11.4): kernel + dispatch untouched;
+  `-o LIGHTNING_INDEXER` 96/96 pass, CUDA0 OK (02:15).
+- (h) rms_norm+mul fusion (T11.5): `build_hc_*` untouched by all T13.
+- (i) Prefill-borrow + MoE caches (T10.2/T10.3/T12.2): files untouched
+  except T13.1's scheduler no-re-reserve hunk in llama-context.cpp;
+  MUL_MAT_ID 981/981 + test-arg-parser (borrow/MoE flags) pass.
+
+## What was NOT tested
+
+- test-llama-archs full matrix: process exited, result UNCONFIRMED at
+  report time (background completion notice not yet collected - update
+  this section when it lands; re-run if it crashed).
+- `-o FLASH_ATTN_EXT` full sweep (incl. 10 T12.1 sparse-turbo cases):
+  process exited after ~70 min, result UNCONFIRMED (same notice situation).
+  If the notice shows failure, the tail + failing case go here and (f)
+  above becomes a blocker.
+- Any weights-based run (no GGUF in-zone): the five RESYNC-T13.md section 6
+  greedy checks are the maintainer's (exact commands there).
+- `test-turbo-quant.exe`, `test-moe-cache*.exe` (fork tests, exist in the
+  tree): not run - no fork .cpp/.cu file they cover was touched by T13.
+- Training-mode graph branches (`81ff93ea1` skipped per plan) - untouched.
+- `glm5-next` arch (not imported) - `indexer_kpool_row=3/by_order=false`
+  defaults are upstream's; only qwen4exp sets row=2/by_order=true.
+
+## Verify manually (maintainer, machine with weights)
+
+1. Collect/update the two UNCONFIRMED gates above (archs matrix,
+   FLASH_ATTN_EXT sweep) from their background completion notices. If archs
+   crashed on a qwen4exp row, paste the failing arch + NMSE/roundtrip lines.
+   If the sweep failed, paste the tail + failing case and mark (f) a blocker.
+2. RESYNC-T13.md section 6 greedy checks 1-5 at T13.5 tip `56633f3e8`
+   (Flash-Next GGUF in-zone as `models/flash-next.gguf`): T10.0 triple,
+   T11.3/T11.5 parity vs `f5fb9f3c7`, T12.1 `37*43` turbo5-vs-q8_0,
+   long-context QSA top_k + sparse parity, prefetch LAZY on/off parity.
+3. If check 2 shows divergence, bisect T13.1..T13.5 (each builds green;
+   T13.2/T13.4 are the large ones) before touching ggml/ kernels.
