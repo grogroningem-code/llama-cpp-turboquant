@@ -2779,7 +2779,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_PREFILL_BORROW"));
     add_opt(common_arg(
         {"--prefill-chunk"}, "auto|N",
-        "prompt tokens used for prefill-borrow sizing (default: auto = min(ubatch, 8192); ubatch splitting is v2) [EXPERIMENTAL]",
+        "prompt tokens used for prefill-borrow sizing (default: auto = min(n_batch, 8192); prompt ubatches are split to this size while borrow is armed) [EXPERIMENTAL]",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.prefill_chunk_tokens = 0;

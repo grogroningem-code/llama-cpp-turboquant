@@ -360,3 +360,143 @@ T10.0, 80539b290 T11.3, 3cd8ab951 T11.4, a162f4a2b T11.5). T11.1/T11.2
 recorded above with reasons, no commits. T10.3 not implemented per task.
 No push (local only). Binaries in build-cuda match tip (rebuilt after the
 last source edit; test binary rebuilt after the eval-sweep revert).
+
+---
+
+# T12 (t11-qwen4exp): turbo5 garbage root cause + prefill-borrow larger chunks + DESIGN-T12.3
+
+Branch t11-qwen4exp, base 25e21fdbd. Target: Qwen3.8-Flash-Next (qwen4exp,
+IQ1_M, 16 GB card, -ncmoe 30). Work done on the 8 GB box (RTX 4070 Laptop);
+no qwen4exp weights in-zone, so no model run was possible here -- the greedy
+triple and all tok/s numbers below must be re-measured on the 16 GB machine
+(see "NOT tested").
+
+## T12.1 turbo5-garbage cause: missing Q-rotation in the QSA path (found by reading)
+
+Suspects T11.3 (sparse FA gather, 80539b290) and T10.0 amend (32e62edfe) are
+INNOCENT for this symptom:
+
+- Sparse gather is numerically exact and, for turbo K/V, runs on the f16
+  copy: the generic MMA path converts K/V to f16 in launch_fattn (need_f16)
+  before the kernel; the native-turbo kernels never enable sparse
+  (VEC sparse_decode is gated on non-quantized K/V, fattn.cu; fused turbo MMA
+  instantiates use_sparse=false). Proven by test, not just reading: 10 new
+  sparse cases pass (below).
+- The T11.3 comment in build_attn_qsa claiming "the CUDA kernel picker routes
+  quantized K/V away from the sparse gather" is wrong about the mechanism
+  (shall_use_sparse does not check dtypes) but benign (conversion happens
+  first). Reworded in the fix.
+
+Actual cause: llama_model_qwen4exp::graph::build_attn_qsa
+(src/models/qwen4exp.cpp) never applies the TurboQuant forward-WHT
+Q-rotation that llm_graph_context::build_attn (src/llama-graph.cpp:3094+)
+applies for dense layers whenever K is a turbo type. Every QSA layer with
+turbo K therefore scores <Q_plain, K_rotated> = garbage on every prompt,
+short or long; broken logits also break EOS, matching "runs to the token
+limit with empty content". q8_0 K needs no rotation, which is exactly why
+-ctk q8_0 stayed correct. Fix mirrors build_attn (pad Q to 128, cont,
+ggml_turbo_wht forward with get_turbo_innerq_scale_inv()), plus the comment
+correction above. q8_0 output path untouched (rotation block is gated on
+k->type being turbo; verified by diff, no shared code changed).
+
+Tests added (tests/test-backend-ops.cpp, after the mixed turbo5/6 block):
+10 sparse FA cases at the QSA shape (256,256,nh=4,nr23 6/1,kv=4096,nb=1/2,
+n_kv_max=512) x (turbo5/turbo4, turbo6/turbo4, turbo4/turbo4, q8_0/turbo4,
+f16/f16). GET_ROWS/indexer cases with turbo K deliberately NOT added: since
+T10.0 the indexer cache stores q8_0, so turbo never reaches GET_ROWS or the
+lightning indexer in production (both abort on turbo by design); the indexer
+sweep already covers q8_0. Note these FA tests pin kernel-vs-kernel
+consistency (CUDA sparse vs CPU dense-mask); the model-convention bug itself
+(missing rotation op in the QSA graph) has no weights-free test -- the greedy
+triple below is the real regression check.
+
+Build: cmake --build build-cuda --config Release (VS 18 2026), exit 0.
+Objs verified newer than edited sources (llama-context.obj 15:31:50,
+test-backend-ops.obj 15:32:25 vs sources 15:28-15:30).
+
+Test output (build-cuda/bin/Release/test-backend-ops.exe test
+-o FLASH_ATTN_EXT -b CUDA0 -p "kv=4096"): 22/22 passed, including all 10 new
+sparse-turbo cases, e.g.
+FLASH_ATTN_EXT(hsk=256,hsv=256,nh=4,nr23 6/1,kv=4096,nb=1,...,type_K=turbo5,type_V=turbo4,...,n_kv_max=512): OK
+(first -b CUDA attempt matched nothing: device names are CUDA0/CPU, and -p
+matches vars(), not op_desc -- reran with -b CUDA0 -p "kv=4096").
+test-arg-parser.exe: all tests OK (covers the arg.cpp help-text change).
+
+## T12.2 prefill-borrow: why auto/auto never beat --moe-cache on, and the fix
+
+From the code (src/llama-context.cpp enter/exit/process_ubatch/decode):
+
+- --prefill-chunk auto = cap 8192, but actual chunk = min(ubatch.n_tokens,
+  cap) at enter(). ubatch size is capped upstream by the init_batch n_ubatch
+  split (llama-kv-cache.cpp prepare/split, hybrid-idx init_batch -- split
+  only sizes yielded ubatches; KV prep covers the whole batch either way). So
+  with default -ub 512 every prompt ubatch borrows for exactly 512 tokens --
+  the borrowed scheduler reserves what the normal path would reserve. No
+  prompt ever runs in a larger ubatch: this is the whole 457 vs 458 story
+  (same work +/- lend/evict + scheduler-recreate noise).
+- --prefill-borrow auto = lend half the largest pool's FREE bytes at first
+  prompt (cold cache approx half the pool), 128 MiB minimum else lend fails
+  and the ubatch falls back to grow_normal (same size, transient buffers).
+- -b/-ub 4096 slower (284): same 4096-token compute as the normal path but
+  on lent slabs (evicted experts must stream during the prompt) + enter/exit
+  sync stalls. Generation 21.8 -> 23.2: after exit, decode buffers shrink to
+  n_seqs size while the no-borrow baseline keeps prompt-sized (4096) compute
+  buffers, leaving less expert VRAM -- decode win, as designed.
+- On the 16 GB card at -ncmoe 30, auto therefore picked chunk = n_ubatch
+  (512 default, 4096 with -ub 4096) and borrowed MiB = half the largest
+  (expert_size,wtype) pool free (>= 128 MiB) -- exact MiB is in the enter log
+  line; it was never the bottleneck, chunk size was.
+
+Fix (src/llama-context.cpp decode(), + log lines): when borrow is eligible
+and the queued batch is prompt-sized (>= 512), split the batch into
+borrow-sized ubatches -- split = min(chunk_cap auto 8192 or user N, n_batch)
+when larger than n_ubatch -- instead of n_ubatch. Buffer sizing is already
+correct for bigger ubatches (enter reserves chunk, grow_normal reserves the
+ubatch transiently; the old "exceeds v1 borrow chunk" guard now only fires
+when the user caps chunk below the split). Help text updated (auto =
+min(n_batch, 8192); "ubatch splitting is v2" removed). New/changed logs:
+
+- decode: prefill borrow splits %u queued tokens into %u-token ubatches (ubatch %u, chunk %s) (once per prompt batch, only when overriding)
+- prefill_borrow_enter: prompt chunk %u tokens on borrowed %zu MiB slab (chunk %s, borrow %s) (chosen values + auto/capped provenance)
+
+With default -b 2048 the 18k prompt now runs in 2048-token ubatches (4x);
+with -b 4096, 4096-token ubatches (8x). If an 8192-token reserve fails on a
+tight card it falls back to grow_normal (same size, transient) and logs it;
+a hard failure there throws exactly as -ub 8192 would today.
+
+## T12.3 DESIGN-T12.3.md (design only, no code)
+
+Written at repo root. Key findings from reading (not assumptions):
+
+- Fork max_batch=8 is a HARD cap (supplied >8 gives session_create null,
+  moe-cache.cu session_create validation), so "fork for prompt batches" is
+  impossible as built; the task's role assignment is inverted vs the gates.
+  Upstream covers <=32 (slot path) and assists >32 read-only (copy_experts,
+  no LRU touch).
+- Smallest version: delete the CLI throw + fork-OFF forcing, keep
+  borrow-vs-upstream exclusion, fixed-upstream-first allocation order gives
+  the one-budget split for free (fork fit measures post-upstream free VRAM);
+  routing falls out structurally (upstream takes <=32, fork sees only what
+  upstream rejects). Recommends V1 + validation gates; V2/V3 rejected with
+  reasons. Open item: the +42% fork prompt mechanism is unexplained by the
+  per-node paths (prompt bypasses at >8) -- experiment specified in the doc
+  before building.
+
+## Verify manually (16 GB machine, weights required -- NOT tested here)
+
+1. Greedy triple, temp 0, -ctk turbo5 -ctv turbo4 vs -ctk q8_0 -ctv turbo4:
+   37*43 (expect 1591, QSA layers must no longer reason about 47*47), the
+   coding prompt from the report, + one long-context prompt (forces QSA
+   top_k + sparse gather). q8_0 output must be byte-identical to head
+   25e21fdbd (fix touches only the turbo-K branch of build_attn_qsa).
+2. Borrow: --moe-cache on --prefill-borrow auto --prefill-chunk auto on the
+   18k prompt; expect the two new log lines (split + chunk/MiB) and prompt
+   tok/s clearly above 458; also try -b 4096 -ub 4096 (expect >= 458, no
+   grow_normal fallback lines). If reserve fails, paste the fallback lines.
+3. Full test-backend-ops to completion (here: only -o FLASH_ATTN_EXT with
+   -p kv=4096 + test-arg-parser).
+4. DESIGN-T12.3 validation items (section 5 a-d, section 6) before any T12.3 code.
+
+Commits on t11-qwen4exp (no push): T12.1 fix + tests, T12.2 fix + logs,
+DESIGN-T12.3.md, this report section. Scratch under cache/scratch/ left
+untracked and uncommitted.

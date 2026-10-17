@@ -1360,7 +1360,9 @@ bool llama_context::prefill_borrow_enter(uint32_t n_tokens, const llama_memory_c
     }
     prefill_borrow_refresh_sizes();
     b.active = true;
-    LLAMA_LOG_INFO("%s: borrowing %zu MiB slab for %u prompt tokens\n", __func__, lent >> 20, chunk);
+    LLAMA_LOG_INFO("%s: prompt chunk %u tokens on borrowed %zu MiB slab (chunk %s, borrow %s)\n", __func__, chunk, lent >> 20,
+        cparams.prefill_chunk_tokens == 0 ? "auto" : "capped",
+        cparams.prefill_borrow_mib < 0 ? "auto" : "capped");
     return true;
 }
 
@@ -3196,8 +3198,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // T10.3: with prefill-borrow armed, split prompts into borrow-sized chunks.
+    // init_batch used to cap every prompt ubatch at n_ubatch, so the borrowed
+    // scheduler reserved exactly what the normal path would and no prompt ever
+    // ran in a larger ubatch (borrow was a no-op for speed). The override only
+    // grows the split; KV slot prep covers the whole batch either way, and the
+    // borrowed/transient buffers are sized for the larger ubatch in enter/grow.
+    uint32_t batch_split = cparams.n_ubatch;
+    if (prefill_borrow.eligible && n_tokens_all >= (int) prefill_borrow_min_tokens) {
+        const uint32_t chunk_cap = cparams.prefill_chunk_tokens > 0
+            ? (uint32_t) cparams.prefill_chunk_tokens : 8192u;
+        const uint32_t borrow_split = std::min(chunk_cap, cparams.n_batch);
+        if (borrow_split > batch_split) {
+            batch_split = borrow_split;
+            LLAMA_LOG_INFO("%s: prefill borrow splits %u queued tokens into %u-token ubatches (ubatch %u, chunk %s)\n",
+                __func__, n_tokens_all, batch_split, cparams.n_ubatch,
+                cparams.prefill_chunk_tokens == 0 ? "auto" : "capped");
+        }
+    }
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, batch_split, output_all);
         if (!mctx) {
             return -2;
         }

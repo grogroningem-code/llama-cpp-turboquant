@@ -1021,9 +1021,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant pre-rotate-queries: K is stored WHT-rotated, so Q must be
+    // rotated too, same as llm_graph_context::build_attn does for dense layers.
+    // Without this the QSA scores are <Q_plain, K_rot> = garbage on every QSA
+    // layer with turbo K (q8_0 K needs no rotation, which is why that config
+    // stayed correct). The indexer already scored with its own query above.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0) {
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale); // 0 = forward, 0 = auto group size
+    }
+
     // sparse FA gather: the QSA mask keeps only the top_k cells per query, so pass the
-    // count as n_kv_max. Turbo K/V stays dense: the CUDA kernel picker routes quantized
-    // K/V away from the sparse gather (fattn.cu), so this never aborts, it just falls back.
+    // count as n_kv_max. Stays correct with turbo K/V: the generic MMA path converts
+    // K/V to f16 before the kernel (launch_fattn need_f16), so the sparse gather sees
+    // f16; the native-turbo kernels (VEC, fused MMA) never enable sparse for quantized K/V.
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 

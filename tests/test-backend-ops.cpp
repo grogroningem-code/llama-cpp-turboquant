@@ -10852,6 +10852,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0));
         }
     }
+    // sparse FA gather (QSA/top_k, n_kv_max > 0) with turbo K/V at the qwen4exp
+    // QSA shape. kv >= 4096 trips shall_use_sparse; the generic MMA path converts
+    // K/V to f16 before the kernel, so the sparse gather stays exact for every
+    // pair below. GET_ROWS/indexer cases with turbo K are intentionally absent:
+    // the indexer cache stores q8_0 since T10.0, so turbo never reaches GET_ROWS
+    // or the lightning indexer in production (both abort on turbo by design).
+    for (int nb : { 1, 2, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0, {0, 1, 2, 3}, true, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0, {0, 1, 2, 3}, true, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, {0, 1, 2, 3}, true, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0, {0, 1, 2, 3}, true, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,       GGML_TYPE_F16,       {0, 1, 2, 3}, true, false, 512));
+    }
     // turbo6_0 / turbo5_0 against the unfused partners, which always take the VEC path
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO6_0));
