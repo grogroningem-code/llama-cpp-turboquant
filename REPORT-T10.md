@@ -668,3 +668,14 @@ kernel, T12.1 turbo WHT/sparse kernels, T11.3 CUDA picker intact);
    long-context QSA top_k + sparse parity, prefetch LAZY on/off parity.
 3. If check 2 shows divergence, bisect T13.1..T13.5 (each builds green;
    T13.2/T13.4 are the large ones) before touching ggml/ kernels.
+
+## T13 gate update (maintainer run)
+
+test-llama-archs full matrix on t13-qwen4exp-resync (static build at 02:25,
+after the last code commit 3ef66d734 at 02:11): exit 0, 482 table lines,
+0 FAIL. qwen4exp rows: CUDA OK (8.96e-08), CPU OK (0.00e+00), Meta OK,
+MoE cache OK (2.39e-14). The earlier exit 139 matches the LNK1104
+locked-DLL collision logged for T13.6 (rebuild during the running sweep);
+it does not reproduce on a clean binary. FLASH_ATTN_EXT 10574/10574 and
+LIGHTNING_INDEXER 96/96 were confirmed above. Weights-based greedy and
+speed checks: see the next maintainer run.
