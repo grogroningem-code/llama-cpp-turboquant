@@ -15,6 +15,8 @@
 // The indexer cache is a side buffer addressed by the cells of the attention cache: same
 // size, padding, stream count and slots, so cell j is the same token in both.
 
+// TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -175,7 +177,7 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool causal_attn) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
