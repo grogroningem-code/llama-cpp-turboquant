@@ -1479,8 +1479,22 @@ void llama_context::sched_reserve() {
         case LLAMA_MOE_CACHE_MODE_UNSPECIFIED:
             break;
     }
+    const char * moe_cache_resolved = "provider";
+    switch (moe_cache_mode) {
+        case GGML_MOE_CACHE_MODE_OFF:
+            moe_cache_resolved = "off";
+            break;
+        case GGML_MOE_CACHE_MODE_AUTO:
+            moe_cache_resolved = "auto";
+            break;
+        case GGML_MOE_CACHE_MODE_ON:
+            moe_cache_resolved = "on";
+            break;
+        case GGML_MOE_CACHE_MODE_UNSPECIFIED:
+            break;
+    }
     LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n", __func__, moe_cache_requested,
-                   moe_cache_eligible ? moe_cache_requested : "off");
+                   moe_cache_resolved);
 
     // T10.3: resolve borrow eligibility now that the fork-cache mode is known.
     // The startup reserve below stays full-size; the tail of this function
