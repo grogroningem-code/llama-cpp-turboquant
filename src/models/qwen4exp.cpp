@@ -949,16 +949,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     cb(q, "indexer_q", il);
 
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim)
-    // one product for all heads, then the heads are summed as slices, so nothing is transposed
-    ggml_tensor * kq = ggml_mul_mat(ctx0,
-            ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
-            ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
-    kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
+    // one product per head, so only [n_pool, n_tokens] scores exist at a time; a single product for all
+    // heads holds n_pool*n_idx_h*n_tokens floats, hundreds of MiB of compute buffer at large ubatches
+    ggml_tensor * k2 = ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool);
+    ggml_tensor * qh = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3)); // [idx_dim, n_tokens, n_idx_h]
 
     ggml_tensor * score = nullptr;
     for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
-        score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
+        ggml_tensor * q_h = ggml_view_2d(ctx0, qh, idx_dim, n_tokens, qh->nb[1], h*qh->nb[2]);
+        ggml_tensor * kq  = ggml_relu(ctx0, ggml_mul_mat(ctx0, k2, q_h)); // [n_pool, n_tokens]
+        score = score ? ggml_add(ctx0, score, kq) : kq;
     }
 
     score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
