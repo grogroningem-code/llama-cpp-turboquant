@@ -990,21 +990,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     GGML_ASSERT(n_sel == inp_kpool->n_sel);
 
     // scatter zeros for the selected cells into an all -inf row, the extra row n_kv takes the sentinels
-    // seeding from sel_idx ties the scatter storage lifetime to this layer
     const int64_t n_kv = inp_kpool->n_kv;
 
-    ggml_tensor * seed = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
+    ggml_tensor * sel = nullptr;
+    if (n_tokens == 1) {
+        // decode: fill the scatter buffers directly instead of broadcasting single elements with
+        // repeat_4d; same values and dtypes as below, fewer nodes and launches
+        ggml_tensor * mask_all = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, kq_mask->type, 1, n_kv + 1, n_tokens), -INFINITY);
+        ggml_tensor * zeros    = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_sel, n_tokens), 0.0f);
+        sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
+    } else {
+        // seeding from sel_idx ties the scatter storage lifetime to this layer
+        ggml_tensor * seed = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
 
-    ggml_tensor * mask_seed = kq_mask->type == GGML_TYPE_F32 ? seed : ggml_cast(ctx0, seed, kq_mask->type);
-    mask_seed = ggml_fill(ctx0, mask_seed, -INFINITY);
-    ggml_tensor * mask_all = ggml_repeat_4d(ctx0, mask_seed, 1, n_kv + 1, n_tokens, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + 1, n_tokens);
+        ggml_tensor * mask_seed = kq_mask->type == GGML_TYPE_F32 ? seed : ggml_cast(ctx0, seed, kq_mask->type);
+        mask_seed = ggml_fill(ctx0, mask_seed, -INFINITY);
+        ggml_tensor * mask_all = ggml_repeat_4d(ctx0, mask_seed, 1, n_kv + 1, n_tokens, 1);
+        mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + 1, n_tokens);
 
-    ggml_tensor * zero_seed = ggml_fill(ctx0, seed, 0.0f);
-    ggml_tensor * zeros = ggml_repeat_4d(ctx0, zero_seed, 1, n_sel, n_tokens, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
+        ggml_tensor * zero_seed = ggml_fill(ctx0, seed, 0.0f);
+        ggml_tensor * zeros = ggml_repeat_4d(ctx0, zero_seed, 1, n_sel, n_tokens, 1);
+        zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
-    ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
+        sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
+    }
 
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
     const size_t row = sel->nb[2];

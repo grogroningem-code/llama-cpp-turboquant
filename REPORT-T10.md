@@ -727,3 +727,21 @@ decode graph 7375 nodes (526a7bde2: 7435), compute buffer unchanged at 1727 MiB.
 So T15.1 removes the 60 nodes T14.1 added but does not change generation speed within noise; the remaining
 ~5% generation cost is the T13 indexer design (mask scatter, k-pool gather), not node count from T14.
 Greedy q8_0/turbo4: same answers as T14 (1591 correct).
+
+# T16 (t13-qwen4exp-resync): decode-only selection-mask build without repeat_4d
+
+Estimate at n_tokens=1, n_kv up to 32768, 48 QSA layers (kpool=4, n_idx_h=4, n_sel~2k):
+mask path per layer is 7 launches (cast, 2 one-elem fills, repeat_4d over n_kv+1 and
+over n_sel, set_rows R+W full buffer, add with kq_mask) and ~0.5 MB traffic, so bandwidth
+is noise and launches dominate: ~336 launches/step, ~1-2 ms against the ~48 ms/token budget.
+The k-pool gather_pooled (~2.3 MB/layer) is bigger traffic but required for scoring, and the
+empty re-pool chain (~9 launches/layer) cannot be skipped: T15 found n_new is padded to >= 1
+(0-dim tensors + graph reuse). So the mask is the biggest safely fixable cost.
+Change: in build_qsa_sel (src/models/qwen4exp.cpp), at n_tokens==1 fill the [1, n_kv+1] -inf
+buffer and the [1, n_sel] zeros buffer directly instead of broadcasting single elements with
+repeat_4d. Same values and same dtypes into set_rows, so output is identical; the prefill
+branch is literally untouched. Saves ~3 launches and ~7 nodes/layer (~300 decode nodes).
+Caveat: T15.1 removed 60 nodes with no speed change, so this may also measure nil.
+Gates: build-cuda-static test-llama-archs exit 0, 0 FAIL, qwen4exp OK on CUDA/CPU/Meta/MoE cache.
+test-backend-ops not run: no op changed, only the graph shape (same as T14).
+Speed: maintainer measures (no server run here).
