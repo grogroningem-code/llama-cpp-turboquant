@@ -704,3 +704,19 @@ requests, 2 runs each, tokens/s prompt / generation):
 
 Greedy check on 526a7bde2: same answers as 05768cdd4 with q8_0/turbo4 and turbo5/turbo4
 (37*43 = 1591 correct; the two 600-700 token prompts end in reasoning, as before).
+
+# T15 (t13-qwen4exp-resync): decode graph node reduction
+
+Change 1: In src/models/qwen4exp.cpp, score k-pool indexer with single mul_mat
+for all heads + head slice summation when n_pool*n_idx_h*n_tokens*4 <= 64 MiB (commit 05768cdd4),
+keeping the per-head loop (526a7bde2) only for large prefill (> 64 MiB). This elides transpose
+and extra mul_mat nodes on decode (n_tokens=1).
+
+Change 2 (skipped): In llama-memory-hybrid-idx, get_n_kpool_new() returns n_new_g, padded to
+>= 1 (std::max(st.n_new, 1u)), so inp_kpool->n_new is never 0 today. Allowing n_new=0 would
+attempt allocating invalid 0-dim GGML tensors (ne1=0) and break graph reuse across decode steps
+where n_new alternates between 0 and 1.
+
+Gates: cmake --build build-cuda-static --config Release --target test-llama-archs -j 16 built clean.
+build-cuda-static/bin/Release/test-llama-archs.exe passed: exit 0, 0 FAIL (qwen4exp OK on CUDA
+8.29e-08, CPU 0.00e+00, Meta, and MoE cache 2.18e-14).
