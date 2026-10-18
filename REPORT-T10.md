@@ -720,3 +720,10 @@ where n_new alternates between 0 and 1.
 Gates: cmake --build build-cuda-static --config Release --target test-llama-archs -j 16 built clean.
 build-cuda-static/bin/Release/test-llama-archs.exe passed: exit 0, 0 FAIL (qwen4exp OK on CUDA
 8.29e-08, CPU 0.00e+00, Meta, and MoE cache 2.18e-14).
+
+T15 measured by the maintainer (same setup as T14, warm requests, 2 runs each, tokens/s prompt / generation):
+decode graph 7375 nodes (526a7bde2: 7435), compute buffer unchanged at 1727 MiB.
+--moe-cache on -ub 4096: f5fb9f3c7 651 / 21.9, bef20be23 977 / 20.7. No cache: f5fb9f3c7 320 / 21.9, bef20be23 357 / 20.8.
+So T15.1 removes the 60 nodes T14.1 added but does not change generation speed within noise; the remaining
+~5% generation cost is the T13 indexer design (mask scatter, k-pool gather), not node count from T14.
+Greedy q8_0/turbo4: same answers as T14 (1591 correct).
