@@ -679,3 +679,28 @@ locked-DLL collision logged for T13.6 (rebuild during the running sweep);
 it does not reproduce on a clean binary. FLASH_ATTN_EXT 10574/10574 and
 LIGHTNING_INDEXER 96/96 were confirmed above. Weights-based greedy and
 speed checks: see the next maintainer run.
+
+# T14 (t13-qwen4exp-resync): compute buffer regression with the fork MoE cache
+
+Cause: T13 scored the k-pool indexer with one product for all heads, an F32 tensor of
+n_pool*n_idx_h*n_tokens (4 heads). At -c 32768 -ub 4096 the CUDA compute buffer grew from
+1574 MiB (f5fb9f3c7) to 2134 MiB; the fork MoE cache (budget free-minus-reserve) lost the same
+VRAM. Fix 526a7bde2 scores one head at a time (src/models/qwen4exp.cpp): compute buffer 1727 MiB.
+Not fixed: +153 MiB remain, the indexer KV cache is 102 MiB vs 51 MiB (raw|pooled rows), and
+T13 added about 800 graph nodes per decode step, which costs about 7% generation without the cache.
+The `[moe-cache] capacity ... granted=0 MiB free=0 MiB` line prints the same in both builds, so it
+does not show the real cache size; not investigated.
+
+Gates: test-llama-archs exit 0, 482 lines, 0 FAIL (qwen4exp OK on CUDA, CPU and MoE cache rows).
+test-backend-ops not run: no op changed, only the graph shape.
+
+Speed (Flash-Next IQ1_M, 16 GB card, -ncmoe 30, -ctk q8_0 -ctv turbo4, 18k-token prompts, warm
+requests, 2 runs each, tokens/s prompt / generation):
+
+| Setup | f5fb9f3c7 | 05768cdd4 (T13) | 526a7bde2 (T14) |
+|---|---|---|---|
+| --moe-cache on -b 4096 -ub 4096 | 641 / 21.6 | 351 / 12.6 | 971 / 20.4 |
+| no cache, default batch | 322 / 22.2 | 358 / 20.8 | 357 / 20.9 |
+
+Greedy check on 526a7bde2: same answers as 05768cdd4 with q8_0/turbo4 and turbo5/turbo4
+(37*43 = 1591 correct; the two 600-700 token prompts end in reasoning, as before).
