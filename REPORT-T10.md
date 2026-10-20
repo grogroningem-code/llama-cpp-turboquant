@@ -745,3 +745,10 @@ Caveat: T15.1 removed 60 nodes with no speed change, so this may also measure ni
 Gates: build-cuda-static test-llama-archs exit 0, 0 FAIL, qwen4exp OK on CUDA/CPU/Meta/MoE cache.
 test-backend-ops not run: no op changed, only the graph shape (same as T14).
 Speed: maintainer measures (no server run here).
+
+T16 measured by the maintainer (same setup as T14/T15, warm requests, 2 runs each, tokens/s prompt / generation):
+decode graph 7291 nodes (T15: 7375), compute buffer unchanged at 1727 MiB.
+--moe-cache on -ub 4096: f5fb9f3c7 640 / 21.5, 4d54111dd 964 / 20.8. No cache: f5fb9f3c7 320 / 21.9, 4d54111dd 360 / 21.0.
+Generation is unchanged from T15 within noise, so the mask construction was not the cost either. The remaining
+~4-5% generation gap is the upstream indexer itself; no further node trimming is planned.
+Greedy q8_0/turbo4: same answers as T14/T15 (1591 correct).
