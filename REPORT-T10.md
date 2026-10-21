@@ -752,3 +752,10 @@ decode graph 7291 nodes (T15: 7375), compute buffer unchanged at 1727 MiB.
 Generation is unchanged from T15 within noise, so the mask construction was not the cost either. The remaining
 ~4-5% generation gap is the upstream indexer itself; no further node trimming is planned.
 Greedy q8_0/turbo4: same answers as T14/T15 (1591 correct).
+
+T16 repeat (2026-10-22, maintainer): 4 blocks per setup in alternating order, warm prompt mean (min-max) and
+generation mean over all requests, tokens/s:
+--moe-cache on -ub 4096: f5fb9f3c7 640 (632-649) / 21.85, 4d54111dd 1001 (975-1021) / 20.45.
+No cache: f5fb9f3c7 321 (319-322) / 21.89, 4d54111dd 357 (350-360) / 20.76.
+Confirms the 2-run result: prompts +56% with the cache and +11% without; generation -6% and -5%
+(spread about 0.5 t/s, so the generation gap is real, not noise).
