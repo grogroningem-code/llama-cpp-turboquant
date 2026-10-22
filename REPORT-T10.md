@@ -799,3 +799,5 @@ to the 32k list (-5%): its rank-256 scores matrix (256 x 248320) is nearly as la
 (32768 x 2560), and it adds a top-k over the whole vocabulary. The head width doubles on the 27B (5120),
 so the 32k slice grows to about 168M weights while the low-rank head stays near 70M; that is where it can win.
 Not yet measured on the 27B or Flash-Next.
+Tests at 34b32e87d (build-cuda-static): test-llama-archs exit 0, 0 FAIL; test-spec-draft-vocab all OK;
+test-backend-ops -o TOP_K 517/517, -o GET_ROWS 119/119.
