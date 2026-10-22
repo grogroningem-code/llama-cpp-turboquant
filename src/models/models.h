@@ -40,6 +40,10 @@ static inline ggml_tensor * build_mtp_lowrank_head(
     if (out_cand_ids) {
         *out_cand_ids = cand;
     }
+    if (n_out == 0) {
+        // no output rows (e.g. prompt pass): the batched mul_mat below would compute 0 % 0 in ggml_can_mul_mat
+        return ggml_view_2d(ctx0, scores, packed_with_ids ? 2 * k : k, 0, scores->nb[1], 0);
+    }
 
     ggml_tensor * cand_1d  = ggml_reshape_1d(ctx0, cand, k * n_out);
     ggml_tensor * w_sub_3d = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, head_w, cand_1d), n_embd, k, n_out);
