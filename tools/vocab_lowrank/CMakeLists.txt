@@ -1,5 +1,5 @@
 set(TARGET llama-vocab-lowrank)
-add_executable(${TARGET} vocab_lowrank.cpp vocab_lowrank_svd.cpp)
+add_executable(${TARGET} vocab_lowrank.cpp vocab_lowrank_svd.cpp vocab_lowrank_states.cpp)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()

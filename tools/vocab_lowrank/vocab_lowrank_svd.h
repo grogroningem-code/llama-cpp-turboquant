@@ -17,4 +17,5 @@ void compute_randomized_svd(
         int rank, int n_iter,
         std::vector<float> & down_f32,
         std::vector<float> & scores_f32,
-        double & energy_share);
+        double & energy_share,
+        const std::vector<double> * L_act = nullptr);

@@ -12,12 +12,13 @@
 #include <vector>
 
 static void usage(const char * prog) {
-    printf("usage: %s -m model.gguf -o out.bin [-n 32768] file [file ...]\n", prog);
+    printf("usage: %s -m model.gguf -o out.bin [-n 32768] [--counts] file [file ...]\n", prog);
 }
 
 int main(int argc, char ** argv) {
     std::string model_path, out_path;
     int32_t top_n = 32768;
+    bool write_counts = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -27,6 +28,8 @@ int main(int argc, char ** argv) {
             out_path = argv[++i];
         } else if (a == "-n" && i + 1 < argc) {
             top_n = atoi(argv[++i]);
+        } else if (a == "-c" || a == "--counts") {
+            write_counts = true;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -80,6 +83,27 @@ int main(int argc, char ** argv) {
 
     // tokenizer hash over pieces in id order (shared with the MTP ctor check)
     const uint64_t hash = spec_draft_vocab_tokenizer_hash(vocab);
+
+    // Counts mode (DVCT v1): when -c / --counts is passed, write all n_vocab uint64 counts
+    // after the 24-byte header (magic "DVCT" = 0x54435644u).
+    if (write_counts) {
+        FILE * fc = fopen(out_path.c_str(), "wb");
+        if (!fc) {
+            printf("error: cannot open '%s' for writing\n", out_path.c_str());
+            return 1;
+        }
+        uint32_t magic = 0x54435644u, version = 1u, uvocab = (uint32_t) n_vocab, count = (uint32_t) n_vocab;
+        fwrite(&magic, 4, 1, fc);
+        fwrite(&version, 4, 1, fc);
+        fwrite(&uvocab, 4, 1, fc);
+        fwrite(&count, 4, 1, fc);
+        fwrite(&hash, 8, 1, fc);
+        fwrite(freq.data(), 8, freq.size(), fc);
+        fclose(fc);
+        printf("wrote %d token counts (n_vocab %d) to '%s'\n", n_vocab, n_vocab, out_path.c_str());
+        llama_model_free(model);
+        return 0;
+    }
 
     std::vector<int32_t> order(n_vocab);
     for (int32_t i = 0; i < n_vocab; i++) {

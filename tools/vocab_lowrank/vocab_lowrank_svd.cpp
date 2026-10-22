@@ -161,16 +161,48 @@ void compute_randomized_svd(
         int rank, int n_iter,
         std::vector<float> & down_f32,
         std::vector<float> & scores_f32,
-        double & energy_share) {
+        double & energy_share,
+        const std::vector<double> * L_act) {
+    const int n_threads = std::max(1, (int) std::thread::hardware_concurrency());
     double total_energy = 0.0;
-    for (size_t i = 0; i < W.size(); ++i) {
-        double v = W[i];
-        total_energy += v * v;
+    if (!L_act) {
+        for (size_t i = 0; i < W.size(); ++i) {
+            double v = W[i];
+            total_energy += v * v;
+        }
+    } else {
+        const double * L = L_act->data();
+        std::vector<double> t_sum(n_threads, 0.0);
+        std::vector<std::thread> workers;
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&, t]() {
+                const int64_t v_beg = (V * t) / n_threads;
+                const int64_t v_end = (V * (t + 1)) / n_threads;
+                double loc_sum = 0.0;
+                for (int64_t v = v_beg; v < v_end; ++v) {
+                    const float * w_row = W.data() + (size_t) v * H;
+                    for (int64_t j = 0; j < H; ++j) {
+                        double dot = 0.0;
+                        for (int64_t i = j; i < H; ++i) {
+                            dot += (double) w_row[i] * L[(size_t) i * H + j];
+                        }
+                        loc_sum += dot * dot;
+                    }
+                }
+                t_sum[t] = loc_sum;
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+        for (int t = 0; t < n_threads; ++t) {
+            total_energy += t_sum[t];
+        }
     }
 
     const int p = (int) std::min<int64_t>(H, rank + 16);
-    printf("lowrank: running randomized SVD (H=%lld, V=%lld, r=%d, p=%d, q=%d)...\n",
-            (long long) H, (long long) V, rank, p, n_iter);
+    printf("lowrank: running randomized SVD (H=%lld, V=%lld, r=%d, p=%d, q=%d, act=%d)...\n",
+            (long long) H, (long long) V, rank, p, n_iter, L_act ? 1 : 0);
     fflush(stdout);
 
     std::mt19937 rng(42);
@@ -181,18 +213,36 @@ void compute_randomized_svd(
     }
 
     std::vector<float> Q_cols((size_t) p * V, 0.0f);
-    const int n_threads = std::max(1, (int) std::thread::hardware_concurrency());
 
     auto mul_W_Zt = [&](const std::vector<float> & Z_in, std::vector<float> & Q_out) {
+        std::vector<float> Z_L;
+        const float * Z_ptr = Z_in.data();
+        if (L_act) {
+            Z_L.assign((size_t) p * H, 0.0f);
+            const double * L = L_act->data();
+            for (int j = 0; j < p; ++j) {
+                const float * z_row = Z_in.data() + (size_t) j * H;
+                float * zl_row = Z_L.data() + (size_t) j * H;
+                for (int64_t i = 0; i < H; ++i) {
+                    const double * l_row = L + (size_t) i * H;
+                    double sum = 0.0;
+                    for (int64_t k = 0; k <= i; ++k) {
+                        sum += l_row[k] * (double) z_row[k];
+                    }
+                    zl_row[i] = (float) sum;
+                }
+            }
+            Z_ptr = Z_L.data();
+        }
         std::vector<std::thread> workers;
         for (int t = 0; t < n_threads; ++t) {
-            workers.emplace_back([&, t]() {
+            workers.emplace_back([&, t, Z_ptr]() {
                 const int64_t v_beg = (V * t) / n_threads;
                 const int64_t v_end = (V * (t + 1)) / n_threads;
                 for (int64_t v0 = v_beg; v0 < v_end; v0 += 256) {
                     const int64_t v1 = std::min<int64_t>(v_end, v0 + 256);
                     for (int j = 0; j < p; ++j) {
-                        const float * z_row = Z_in.data() + (size_t) j * H;
+                        const float * z_row = Z_ptr + (size_t) j * H;
                         float * q_col = Q_out.data() + (size_t) j * V;
                         for (int64_t v = v0; v < v1; ++v) {
                             const float * w_row = W.data() + (size_t) v * H;
@@ -244,6 +294,21 @@ void compute_randomized_svd(
                 B_out[i] += partial[t][i];
             }
         }
+        if (L_act) {
+            const double * L = L_act->data();
+            std::vector<float> tmp(H);
+            for (int j = 0; j < p; ++j) {
+                float * b_row = B_out.data() + (size_t) j * H;
+                for (int64_t k = 0; k < H; ++k) {
+                    double sum = 0.0;
+                    for (int64_t i = k; i < H; ++i) {
+                        sum += (double) b_row[i] * L[(size_t) i * H + k];
+                    }
+                    tmp[k] = (float) sum;
+                }
+                std::copy(tmp.begin(), tmp.end(), b_row);
+            }
+        }
     };
 
     mul_W_Zt(Z, Q_cols);
@@ -275,9 +340,26 @@ void compute_randomized_svd(
     fflush(stdout);
 
     down_f32.resize((size_t) H * rank);
-    for (int k = 0; k < rank; ++k) {
-        for (int64_t d = 0; d < H; ++d) {
-            down_f32[(size_t) k * H + d] = (float) Vt[(size_t) k * H + d];
+    if (!L_act) {
+        for (int k = 0; k < rank; ++k) {
+            for (int64_t d = 0; d < H; ++d) {
+                down_f32[(size_t) k * H + d] = (float) Vt[(size_t) k * H + d];
+            }
+        }
+    } else {
+        const double * L = L_act->data();
+        std::vector<double> y(H);
+        for (int k = 0; k < rank; ++k) {
+            const double * v_row = Vt.data() + (size_t) k * H;
+            // down row d solves d L = v, i.e. L^T d^T = v^T: back substitution over L^T
+            for (int64_t i = H - 1; i >= 0; --i) {
+                double sum = v_row[i];
+                for (int64_t j = i + 1; j < H; ++j) {
+                    sum -= y[j] * L[(size_t) j * H + i];
+                }
+                y[i] = sum / L[(size_t) i * H + i];
+                down_f32[(size_t) k * H + i] = (float) y[i];
+            }
         }
     }
 

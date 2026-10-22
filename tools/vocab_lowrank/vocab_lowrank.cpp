@@ -1,13 +1,14 @@
 // Build a low-rank SVD sidecar GGUF for the MTP draft head.
 // usage: llama-vocab-lowrank -m model.gguf -o lowrank.gguf [-r 128] [-q 2] [--eval file.txt [-n 200] [-k 128]]
 #include "vocab_lowrank_svd.h"
+#include "vocab_lowrank_states.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
-#include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,15 +18,15 @@
 #include <vector>
 
 static void usage(const char * prog) {
-    printf("usage: %s -m model.gguf -o lowrank.gguf [-r 128] [-q 2] [--eval file.txt [-n 200] [-k 128]]\n", prog);
+    printf("usage: %s -m model.gguf -o lowrank.gguf [-r 128] [-q 2] [--weight-act calib.txt] [--weight-freq freq.bin|file.txt] [--eval file.txt [-n 200] [-k 128]]\n", prog);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, out_path, eval_path;
+    std::string model_path, out_path, eval_path, weight_act_path, weight_freq_path;
     int rank = 128;
     int n_iter = 2;
     int eval_n = 200;
-    int eval_k = 128;
+    std::vector<int> eval_ks;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -37,12 +38,16 @@ int main(int argc, char ** argv) {
             rank = std::atoi(argv[++i]);
         } else if (a == "-q" && i + 1 < argc) {
             n_iter = std::atoi(argv[++i]);
+        } else if (a == "--weight-act" && i + 1 < argc) {
+            weight_act_path = argv[++i];
+        } else if (a == "--weight-freq" && i + 1 < argc) {
+            weight_freq_path = argv[++i];
         } else if (a == "--eval" && i + 1 < argc) {
             eval_path = argv[++i];
         } else if (a == "-n" && i + 1 < argc) {
             eval_n = std::atoi(argv[++i]);
         } else if (a == "-k" && i + 1 < argc) {
-            eval_k = std::atoi(argv[++i]);
+            eval_ks.push_back(std::atoi(argv[++i]));
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -50,6 +55,9 @@ int main(int argc, char ** argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+    if (eval_ks.empty()) {
+        eval_ks.push_back(128);
     }
 
     if (model_path.empty() || out_path.empty() || rank <= 0) {
@@ -136,11 +144,232 @@ int main(int argc, char ** argv) {
     gguf_free(ctx_gguf);
     ggml_free(ctx_meta);
 
+    // Optional frequency weighting (--weight-freq): scale row v of W by sqrt(freq_v / mean(freq) + 10)
+    std::vector<float> sqrt_freq;
+    if (!weight_freq_path.empty()) {
+        std::vector<double> freq((size_t) V, 0.0);
+        FILE * ff = fopen(weight_freq_path.c_str(), "rb");
+        if (!ff) {
+            fprintf(stderr, "error: cannot open freq file '%s'\n", weight_freq_path.c_str());
+            return 1;
+        }
+        _fseeki64(ff, 0, SEEK_END);
+        int64_t fsize = _ftelli64(ff);
+        _fseeki64(ff, 0, SEEK_SET);
+        uint32_t magic = 0;
+        if (fsize >= 24 && fread(&magic, 4, 1, ff) == 1 && (magic == 0x54435644u || magic == 0x32335644u)) {
+            uint32_t version = 0, file_vocab = 0, count = 0;
+            uint64_t hash = 0;
+            if (fread(&version, 4, 1, ff) != 1 || fread(&file_vocab, 4, 1, ff) != 1 ||
+                fread(&count, 4, 1, ff) != 1 || fread(&hash, 8, 1, ff) != 1) {
+                fprintf(stderr, "error: short header read in '%s'\n", weight_freq_path.c_str());
+                fclose(ff);
+                return 1;
+            }
+            if ((int64_t) file_vocab != V) {
+                fprintf(stderr, "error: freq file n_vocab %u != %lld\n", file_vocab, (long long) V);
+                fclose(ff);
+                return 1;
+            }
+            if (magic == 0x54435644u && fsize == 24 + (int64_t) V * 8) {
+                std::vector<int64_t> counts((size_t) V);
+                if (fread(counts.data(), 8, (size_t) V, ff) != (size_t) V) {
+                    fprintf(stderr, "error: short counts read in '%s'\n", weight_freq_path.c_str());
+                    fclose(ff);
+                    return 1;
+                }
+                for (int64_t v = 0; v < V; ++v) {
+                    freq[v] = (double) std::max<int64_t>(0, counts[v]);
+                }
+            } else if (magic == 0x32335644u && fsize == 24 + (int64_t) count * 4 + (int64_t) V * 8) {
+                _fseeki64(ff, 24 + (int64_t) count * 4, SEEK_SET);
+                std::vector<int64_t> counts((size_t) V);
+                if (fread(counts.data(), 8, (size_t) V, ff) != (size_t) V) {
+                    fprintf(stderr, "error: short counts tail read in '%s'\n", weight_freq_path.c_str());
+                    fclose(ff);
+                    return 1;
+                }
+                for (int64_t v = 0; v < V; ++v) {
+                    freq[v] = (double) std::max<int64_t>(0, counts[v]);
+                }
+            } else if (magic == 0x32335644u && fsize == 24 + (int64_t) count * 4) {
+                std::vector<int32_t> ids(count);
+                if (count > 0 && fread(ids.data(), 4, count, ff) != count) {
+                    fprintf(stderr, "error: short id read in '%s'\n", weight_freq_path.c_str());
+                    fclose(ff);
+                    return 1;
+                }
+                for (uint32_t r = 0; r < count; ++r) {
+                    if (ids[r] >= 0 && ids[r] < V) {
+                        freq[ids[r]] = 1.0 / (double) (r + 1);
+                    }
+                }
+            } else {
+                fprintf(stderr, "error: unrecognized DV header/size in '%s'\n", weight_freq_path.c_str());
+                fclose(ff);
+                return 1;
+            }
+            fclose(ff);
+        } else if (fsize == (int64_t) V * 8) {
+            _fseeki64(ff, 0, SEEK_SET);
+            std::vector<int64_t> counts((size_t) V);
+            if (fread(counts.data(), 8, (size_t) V, ff) != (size_t) V) {
+                fprintf(stderr, "error: short raw int64 read in '%s'\n", weight_freq_path.c_str());
+                fclose(ff);
+                return 1;
+            }
+            fclose(ff);
+            for (int64_t v = 0; v < V; ++v) {
+                freq[v] = (double) std::max<int64_t>(0, counts[v]);
+            }
+        } else {
+            fclose(ff);
+            // Treat as text corpus and tokenize with vocab_only model
+            llama_backend_init();
+            llama_model_params mp = llama_model_default_params();
+            mp.vocab_only = true;
+            llama_model * vmodel = llama_model_load_from_file(model_path.c_str(), mp);
+            if (!vmodel) {
+                fprintf(stderr, "error: failed to load vocab from '%s'\n", model_path.c_str());
+                return 1;
+            }
+            const llama_vocab * vocab = llama_model_get_vocab(vmodel);
+            std::ifstream in(weight_freq_path, std::ios::binary);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            std::string text = ss.str();
+            std::vector<llama_token> buf(text.size() + 4);
+            int32_t n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), buf.data(), (int32_t) buf.size(), false, false);
+            if (n < 0) {
+                buf.resize(-n);
+                n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), buf.data(), (int32_t) buf.size(), false, false);
+            }
+            for (int32_t i = 0; i < n; ++i) {
+                if (buf[i] >= 0 && buf[i] < V) {
+                    freq[buf[i]] += 1.0;
+                }
+            }
+            llama_model_free(vmodel);
+        }
+
+        double sum_freq = 0.0;
+        int64_t n_nonzero = 0;
+        for (int64_t v = 0; v < V; ++v) {
+            sum_freq += freq[v];
+            if (freq[v] > 0.0) {
+                n_nonzero++;
+            }
+        }
+        double mean_freq = sum_freq / (double) V;
+        if (mean_freq <= 0.0) {
+            fprintf(stderr, "error: mean(freq) <= 0 in '%s'\n", weight_freq_path.c_str());
+            return 1;
+        }
+        printf("lowrank: applying frequency weighting from '%s' (nonzero=%lld/%lld, mean=%.6f, smooth=10.0)...\n",
+                weight_freq_path.c_str(), (long long) n_nonzero, (long long) V, mean_freq);
+        fflush(stdout);
+
+        sqrt_freq.resize((size_t) V);
+        for (int64_t v = 0; v < V; ++v) {
+            float sf = (float) std::sqrt(freq[v] / mean_freq + 10.0);
+            sqrt_freq[v] = sf;
+            float * w_row = W.data() + (size_t) v * H;
+            for (int64_t d = 0; d < H; ++d) {
+                w_row[d] *= sf;
+            }
+        }
+    }
+
+    // Load model once if needed for --weight-act or --eval
+    llama_model * model = nullptr;
+    if (!weight_act_path.empty() || (!eval_path.empty() && eval_n > 0)) {
+        llama_backend_init();
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = 99;
+        mparams.load_mtp = true;
+        model = llama_model_load_from_file(model_path.c_str(), mparams);
+        if (!model) {
+            fprintf(stderr, "error: failed to load model '%s'\n", model_path.c_str());
+            return 1;
+        }
+    }
+
+    // Optional activation weighting (--weight-act): C = X^T X / n + eps*I, Cholesky C = L L^T
+    std::vector<double> L_act;
+    if (!weight_act_path.empty()) {
+        lowrank_states cal;
+        if (!lowrank_states_collect(model, weight_act_path, eval_n, H, cal)) {
+            lowrank_states_free(cal);
+            return 1;
+        }
+        const float * h_mtp = cal.h_mtp;
+
+        std::vector<double> C((size_t) H * H, 0.0);
+        const double inv_n = 1.0 / (double) eval_n;
+        for (int t = 0; t < eval_n; ++t) {
+            const float * x = h_mtp + (size_t) t * H;
+            for (int64_t i = 0; i < H; ++i) {
+                const double xi = (double) x[i] * inv_n;
+                double * c_row = C.data() + (size_t) i * H;
+                for (int64_t j = 0; j <= i; ++j) {
+                    c_row[j] += xi * (double) x[j];
+                }
+            }
+        }
+        lowrank_states_free(cal);
+
+        double trace_C = 0.0;
+        for (int64_t i = 0; i < H; ++i) {
+            trace_C += C[(size_t) i * H + i];
+        }
+        const double eps = 1e-4 * (trace_C / (double) H);
+        for (int64_t i = 0; i < H; ++i) {
+            C[(size_t) i * H + i] += eps;
+        }
+        printf("lowrank: calib '%s' (%d MTP states): mean_diag=%.6f, eps=%.6e, computing Cholesky...\n",
+                weight_act_path.c_str(), eval_n, trace_C / (double) H, eps);
+        fflush(stdout);
+
+        L_act.assign((size_t) H * H, 0.0);
+        for (int64_t i = 0; i < H; ++i) {
+            const double * c_row = C.data() + (size_t) i * H;
+            double * l_row_i = L_act.data() + (size_t) i * H;
+            for (int64_t j = 0; j <= i; ++j) {
+                const double * l_row_j = L_act.data() + (size_t) j * H;
+                double sum = c_row[j];
+                for (int64_t k = 0; k < j; ++k) {
+                    sum -= l_row_i[k] * l_row_j[k];
+                }
+                if (i == j) {
+                    if (sum <= 0.0) {
+                        fprintf(stderr, "error: Cholesky failed at i=%lld (sum=%e)\n", (long long) i, sum);
+                        return 1;
+                    }
+                    l_row_i[j] = std::sqrt(sum);
+                } else {
+                    l_row_i[j] = sum / l_row_j[j];
+                }
+            }
+        }
+    }
+
     std::vector<float> down_f32, scores_f32;
     double energy_share = 0.0;
-    compute_randomized_svd(W, H, V, rank, n_iter, down_f32, scores_f32, energy_share);
+    compute_randomized_svd(W, H, V, rank, n_iter, down_f32, scores_f32, energy_share, L_act.empty() ? nullptr : &L_act);
     W.clear();
     W.shrink_to_fit();
+    L_act.clear();
+    L_act.shrink_to_fit();
+
+    if (!sqrt_freq.empty()) {
+        for (int64_t v = 0; v < V; ++v) {
+            float inv_sf = 1.0f / sqrt_freq[v];
+            float * s_row = scores_f32.data() + (size_t) v * rank;
+            for (int k = 0; k < rank; ++k) {
+                s_row[k] *= inv_sf;
+            }
+        }
+    }
 
     std::vector<ggml_fp16_t> down_f16(down_f32.size());
     for (size_t i = 0; i < down_f32.size(); ++i) {
@@ -192,152 +421,19 @@ int main(int argc, char ** argv) {
 
     // 5. Optional recall check on eval_n hidden states from eval_path
     if (!eval_path.empty() && eval_n > 0) {
-        W.clear();
-        W.shrink_to_fit();
-        llama_backend_init();
-        std::ifstream in(eval_path, std::ios::binary);
-        if (!in) {
-            fprintf(stderr, "error: cannot open eval file '%s'\n", eval_path.c_str());
+        lowrank_states ev;
+        const bool ok = lowrank_states_collect(model, eval_path, eval_n, H, ev);
+        if (ok) {
+            lowrank_print_recall(ev, false, eval_n, H, V, rank, down_f32, scores_f32, eval_ks, eval_path);
+            lowrank_print_recall(ev, true,  eval_n, H, V, rank, down_f32, scores_f32, eval_ks, eval_path);
+        }
+        lowrank_states_free(ev);
+        if (!ok) {
             return 1;
         }
-        std::stringstream ss;
-        ss << in.rdbuf();
-        std::string text = ss.str();
+    }
 
-        llama_model_params mparams = llama_model_default_params();
-        mparams.n_gpu_layers = 99;
-        mparams.load_mtp = true;
-        llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
-        if (!model) {
-            fprintf(stderr, "error: failed to load model '%s' for eval\n", model_path.c_str());
-            return 1;
-        }
-        const llama_vocab * vocab = llama_model_get_vocab(model);
-        std::vector<llama_token> toks(text.size() + 8);
-        int32_t n_tok = llama_tokenize(vocab, text.data(), (int32_t) text.size(), toks.data(), (int32_t) toks.size(), true, false);
-        if (n_tok < 0) {
-            toks.resize(-n_tok);
-            n_tok = llama_tokenize(vocab, text.data(), (int32_t) text.size(), toks.data(), (int32_t) toks.size(), true, false);
-        }
-        if (n_tok < eval_n) {
-            fprintf(stderr, "error: eval file has only %d tokens, need %d\n", n_tok, eval_n);
-            return 1;
-        }
-
-        llama_context_params cparams = llama_context_default_params();
-        cparams.n_ctx = std::max(512, eval_n + 64);
-        cparams.n_batch = eval_n;
-        cparams.n_ubatch = eval_n;
-        cparams.embeddings = true;
-        llama_context * ctx = llama_init_from_model(model, cparams);
-        if (!ctx) {
-            fprintf(stderr, "error: failed to create context for eval\n");
-            return 1;
-        }
-        llama_set_embeddings_nextn(ctx, true, false);
-
-        llama_context_params cparams_dft = llama_context_default_params();
-        cparams_dft.n_ctx = std::max(512, eval_n + 64);
-        cparams_dft.n_batch = eval_n;
-        cparams_dft.n_ubatch = eval_n;
-        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        llama_context * ctx_dft = llama_init_from_model(model, cparams_dft);
-        if (ctx_dft) {
-            llama_set_embeddings_nextn(ctx_dft, true, false);
-        }
-
-        llama_batch batch = llama_batch_init(eval_n, 0, 1);
-        batch.n_tokens = eval_n;
-        for (int i = 0; i < eval_n; ++i) {
-            batch.token[i]    = toks[i];
-            batch.pos[i]      = i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0]= 0;
-            batch.logits[i]   = 1;
-        }
-
-        if (llama_decode(ctx, batch) != 0) {
-            fprintf(stderr, "error: llama_decode failed on eval tokens\n");
-            return 1;
-        }
-
-        auto eval_recall = [&](const float * h_all, int n_rows, const char * label) {
-            int hits = 0;
-            for (int t = 0; t < n_rows; ++t) {
-                const float * h = h_all + (size_t) t * H;
-                // Compute full head argmax directly on W [V, H] or from llama_get_logits_ith
-                // Wait: for trunk, llama_get_logits_ith(ctx, t) is exact; for MTP, llama_get_logits_ith(ctx_dft, t) is exact!
-                const float * full_logits = (std::strcmp(label, "trunk") == 0)
-                    ? llama_get_logits_ith(ctx, t)
-                    : llama_get_logits_ith(ctx_dft, t);
-                int full_argmax = (int) (std::max_element(full_logits, full_logits + V) - full_logits);
-
-                std::vector<float> z(rank, 0.0f);
-                for (int k = 0; k < rank; ++k) {
-                    const float * d_row = down_f32.data() + (size_t) k * H;
-                    float sum = 0.0f;
-                    for (int64_t d = 0; d < H; ++d) {
-                        sum += d_row[d] * h[d];
-                    }
-                    z[k] = sum;
-                }
-
-                std::vector<float> lr(V);
-                for (int64_t v = 0; v < V; ++v) {
-                    const float * s_row = scores_f32.data() + (size_t) v * rank;
-                    float sum = 0.0f;
-                    for (int k = 0; k < rank; ++k) {
-                        sum += s_row[k] * z[k];
-                    }
-                    lr[v] = sum;
-                }
-
-                float target_lr = lr[full_argmax];
-                int strictly_greater = 0;
-                for (int64_t v = 0; v < V; ++v) {
-                    if (lr[v] > target_lr) {
-                        strictly_greater++;
-                    }
-                }
-                if (strictly_greater < eval_k) {
-                    hits++;
-                }
-            }
-            printf("lowrank: recall@%d on %d %s hidden states from '%s': %d / %d = %.4f (%.2f%%)\n",
-                    eval_k, n_rows, label, eval_path.c_str(), hits, n_rows,
-                    (double) hits / n_rows, 100.0 * hits / n_rows);
-            fflush(stdout);
-        };
-
-        const float * h_trunk = llama_get_embeddings_nextn(ctx);
-        eval_recall(h_trunk, eval_n, "trunk");
-
-        if (ctx_dft && n_tok >= eval_n + 1) {
-            llama_batch batch_mtp = llama_batch_init(eval_n, (int32_t) H, 1);
-            batch_mtp.token = (llama_token *) malloc(sizeof(llama_token) * eval_n);
-            batch_mtp.n_tokens = eval_n;
-            for (int i = 0; i < eval_n; ++i) {
-                batch_mtp.token[i]    = toks[i + 1];
-                batch_mtp.pos[i]      = i + 1;
-                batch_mtp.n_seq_id[i] = 1;
-                batch_mtp.seq_id[i][0]= 0;
-                batch_mtp.logits[i]   = 1;
-                std::memcpy(batch_mtp.embd + (size_t) i * H, h_trunk + (size_t) i * H, (size_t) H * sizeof(float));
-            }
-            if (llama_decode(ctx_dft, batch_mtp) == 0) {
-                const float * h_mtp = llama_get_embeddings_nextn(ctx_dft);
-                eval_recall(h_mtp, eval_n, "mtp");
-            }
-            free(batch_mtp.token);
-            batch_mtp.token = nullptr;
-            llama_batch_free(batch_mtp);
-        }
-
-        if (ctx_dft) {
-            llama_free(ctx_dft);
-        }
-        llama_batch_free(batch);
-        llama_free(ctx);
+    if (model) {
         llama_model_free(model);
     }
 
