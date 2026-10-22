@@ -759,3 +759,43 @@ generation mean over all requests, tokens/s:
 No cache: f5fb9f3c7 321 (319-322) / 21.89, 4d54111dd 357 (350-360) / 20.76.
 Confirms the 2-run result: prompts +56% with the cache and +11% without; generation -6% and -5%
 (spread about 0.5 t/s, so the generation gap is real, not noise).
+
+## T17 low-rank two-stage MTP draft head (EAGLE-4 idea)
+
+What it is: the MTP draft head scores the whole vocabulary through a rank-r factor (scores [r, V] x down [H, r]),
+takes the top C candidates, and computes exact logits only for those rows of the real head.
+Flags: --spec-draft-lowrank FILE --spec-draft-candidates C; sidecar from tools/vocab_lowrank.
+Code by Gemini 4 Argon (4856a82a9, 0e6362f2b); fixes by the maintainer session:
+- T17.1 acfc344bf: the server died with an integer divide by zero on the first prompt (a decode with no
+  output rows made ggml_can_mul_mat compute 0 % 0). The head now skips the gather when there are no rows.
+- T17.2 5e6d62756: plain SVD is too weak on this model, so the tool gained --weight-act (activation-aware SVD:
+  whiten by the Cholesky factor of the MTP hidden-state covariance) and --weight-freq (EAGLE-4 weighted_low_rank).
+  Argon's down-factor solve applied the wrong inverse (0% recall); fixed to back substitution over L^T.
+
+Recall = share of rows whose full-head argmax is among the C low-rank candidates
+(Qwen3.5-4B, calibrated on p1-prose, measured on 2000 MTP states of p2-code):
+
+| sidecar | energy kept | C=128 | C=512 | C=1024 |
+|---|---|---|---|---|
+| plain SVD r=128 | 24% | 36.5% | | 50.5% |
+| plain SVD r=512 | 40% | 49.5% | | 71.5% |
+| act r=128 | 89% | 58.4% | 76.2% | 83.7% |
+| act r=256 | 93% | 76.8% | 90.2% | 94.4% |
+
+--weight-freq was written but not measured.
+
+Server, 4B on the RTX 4070 Laptop, -ngl 99 -c 8192, draft-mtp, first 8000 chars of each prompt file, 256 tokens,
+temperature 0, 2 runs each (runs within 1.5%), generation tokens/s and accepted/drafted:
+
+| draft head | prose | code |
+|---|---|---|
+| full head | 66.9 (112/427) | 102.4 (164/275) |
+| 32k list (--spec-draft-vocab) | 82.2 (111/430) | 118.6 (158/289) |
+| low-rank act r=256, C=512 | 78.1 (112/428) | 106.6 (152/305) |
+| low-rank act r=256, C=1024 | 77.2 (112/428) | 111.9 (157/290) |
+
+Text is byte-identical across all arms. On the 4B the low-rank head beats the full head (+9 to +17%) but loses
+to the 32k list (-5%): its rank-256 scores matrix (256 x 248320) is nearly as large as the 32k slice
+(32768 x 2560), and it adds a top-k over the whole vocabulary. The head width doubles on the 27B (5120),
+so the 32k slice grows to about 168M weights while the low-rank head stays near 70M; that is where it can win.
+Not yet measured on the 27B or Flash-Next.
