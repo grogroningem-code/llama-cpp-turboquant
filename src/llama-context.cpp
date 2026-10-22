@@ -312,8 +312,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_outputs_max =
         params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload     = params.op_offload;
+    cparams.kv_unified     = params.kv_unified;
+    cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -785,7 +787,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
         sched_reserve();
@@ -4145,6 +4147,9 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->begin();
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -4159,9 +4164,14 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // the slot maps of the MoE cache
+    // the slot maps of the MoE cache and the inputs of its CPU part
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
+    }
+
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) ||
+        ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
     }
 
     auto & st = lctx->copy_experts;
@@ -5293,6 +5303,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_mode              =*/LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/0,
         /*.moe_cache_size              =*/0,
+        /*.moe_cache_cpu_share         =*/0.0f,
         /*.prefill_borrow_mib          =*/0,
         /*.prefill_chunk_tokens        =*/0,
         /*.abort_callback              =*/nullptr,

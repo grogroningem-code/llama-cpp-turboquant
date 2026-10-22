@@ -1785,7 +1785,13 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 }
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                // a negative id skips the row, its result is zero
+                if (i02 < 0) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+
+                assert(i02 < n_as);
 
                 if (moe_cache_node && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
                     const int64_t i11 = id % ne11;

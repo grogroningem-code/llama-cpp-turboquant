@@ -1730,7 +1730,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
     cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
 
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     cparams.prefill_borrow_mib   = params.prefill_borrow_mib;
     cparams.prefill_chunk_tokens = params.prefill_chunk_tokens;

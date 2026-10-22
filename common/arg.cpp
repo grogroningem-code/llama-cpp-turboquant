@@ -2762,6 +2762,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-cpu-share"}, "F",
+        string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
+        [](common_params & params, const std::string & value) {
+            const float share = std::stof(value);
+            if (share < 0.0f || share > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_cpu_share = share;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
+    add_opt(common_arg(
         {"--prefill-borrow"}, "off|auto|N",
         "borrow N MiB (or 'auto' = half the largest MoE slot-cache pool) of GPU expert-cache slab for prompt compute buffers, returned before decode (default: off; v1: fork --moe-cache only, single GPU, no --moe-cache-mib, no --kv-stream-arena-mib) [EXPERIMENTAL]",
         [](common_params & params, const std::string & value) {

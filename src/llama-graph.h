@@ -757,7 +757,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    llama_moe_cache              * moe_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -998,7 +998,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    llama_moe_cache              * moe_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1029,13 +1029,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * w_s    = nullptr,
+              ggml_tensor * slots  = nullptr,
+                     bool   cached = true) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
