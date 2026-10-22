@@ -1473,6 +1473,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // mutates the set per step (no accept calls), so a handle bug costs
     // acceptance rate only, never correctness
     std::unique_ptr<spec_draft_vocab_handle> draft_vocab;
+    bool draft_lowrank_on = false;
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -1615,6 +1616,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             draft_vocab.reset(new spec_draft_vocab_handle(subset_ids, (int32_t) n_seq));
             subset_on = true;
             SPC_INF("spec-draft-vocab: subset head on (%d ids)\n", (int) subset_ids.size());
+        }
+        if (!this->params.draft_lowrank_path.empty()) {
+            if (subset_on) {
+                GGML_ABORT("spec-draft-lowrank: mutually exclusive with --spec-draft-vocab");
+            }
+            if (chain_heads) {
+                GGML_ABORT("spec-draft-lowrank: chained multi-head MTP is not supported (single-head only)");
+            }
+            if (!llama_set_spec_draft_lowrank(ctx_dft, this->params.draft_lowrank_path.c_str(), this->params.draft_lowrank_candidates)) {
+                GGML_ABORT("spec-draft-lowrank: low-rank sidecar install failed (see log)");
+            }
+            draft_lowrank_on = true;
+            subset_on = true;
+            SPC_INF("spec-draft-lowrank: low-rank head on (file='%s', candidates=%d)\n",
+                    this->params.draft_lowrank_path.c_str(), (int) this->params.draft_lowrank_candidates);
         }
 
         // offload draft sampling to the backend (chained drafting outputs several
@@ -2294,7 +2310,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // subset draft rows are packed [n_sub]: sample through the
                 // subset sampler so candidates map to vocab ids
                 llama_token id_sampled;
-                if (draft_vocab) {
+                if (draft_lowrank_on) {
+                    id_sampled = common_sampler_sample_lowrank(smpl, ctx_dft, i_last[seq_id], true);
+                } else if (draft_vocab) {
                     id_sampled = common_sampler_sample_subset(smpl, ctx_dft, i_last[seq_id], true);
                 } else {
                     id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);

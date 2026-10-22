@@ -849,6 +849,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.mtp_chain               == other.cparams.mtp_chain               &&
             cparams.spec_draft_subset       == other.cparams.spec_draft_subset       &&
+            cparams.spec_draft_lowrank_k    == other.cparams.spec_draft_lowrank_k    &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&

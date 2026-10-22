@@ -847,6 +847,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (!params.speculative.draft.draft_vocab_path.empty() && !params.speculative.draft.draft_lowrank_path.empty()) {
+        throw std::invalid_argument("error: --spec-draft-vocab and --spec-draft-lowrank are mutually exclusive\n");
+    }
+
     if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts) {
         LOG_INF("explicit MoE cache mode disables weight repacking\n");
         params.no_extra_bufts = true;
@@ -4294,6 +4298,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.draft_vocab_extra = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_EXTRA"));
+    add_opt(common_arg(
+        {"--spec-draft-lowrank"}, "PATH",
+        "low-rank SVD sidecar GGUF for the MTP draft head; mutually exclusive with --spec-draft-vocab (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.draft_lowrank_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LOWRANK"));
+    add_opt(common_arg(
+        {"--spec-draft-candidates"}, "N",
+        string_format("number of top candidates from low-rank scores to score exactly (default: %d)", params.speculative.draft.draft_lowrank_candidates),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("error: --spec-draft-candidates must be >= 1");
+            }
+            params.speculative.draft.draft_lowrank_candidates = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CANDIDATES"));
 
     add_opt(common_arg(
         {"--gdn-replay"},

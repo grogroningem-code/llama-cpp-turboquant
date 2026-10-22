@@ -185,6 +185,22 @@ static void test_flags(void) {
         std::vector<std::string> argv = {"binary_name", "-m", "model.gguf", "--spec-draft-extra", "1"};
         assert(false == common_params_parse(argv.size(), to_argv(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     }
+
+    // lowrank flags and mutual exclusivity with --spec-draft-vocab
+    {
+        common_params params;
+        assert(params.speculative.draft.draft_lowrank_path.empty());
+        assert(params.speculative.draft.draft_lowrank_candidates == 128);
+        std::vector<std::string> argv = {"binary_name", "-m", "model.gguf", "--spec-draft-lowrank", "lowrank.gguf", "--spec-draft-candidates", "64"};
+        assert(true == common_params_parse(argv.size(), to_argv(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(params.speculative.draft.draft_lowrank_path == "lowrank.gguf");
+        assert(params.speculative.draft.draft_lowrank_candidates == 64);
+    }
+    {
+        common_params params;
+        std::vector<std::string> argv = {"binary_name", "-m", "model.gguf", "--spec-draft-vocab", "draft.bin", "--spec-draft-lowrank", "lowrank.gguf"};
+        assert(false == common_params_parse(argv.size(), to_argv(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    }
 }
 
 static void test_handle(void) {

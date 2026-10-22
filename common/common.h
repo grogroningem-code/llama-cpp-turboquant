@@ -365,6 +365,8 @@ struct common_params_speculative_draft {
 
     std::string draft_vocab_path; // fixed draft id list for the MTP head (default: empty = off)
     int32_t draft_vocab_extra = 0; // reserved for the v2 sequence ring (nonzero rejected in v1)
+    std::string draft_lowrank_path; // low-rank SVD sidecar GGUF for the MTP head (default: empty = off)
+    int32_t draft_lowrank_candidates = 128; // top-k candidates scored exactly by the low-rank MTP head
 };
 
 struct common_params_speculative_ngram_mod {

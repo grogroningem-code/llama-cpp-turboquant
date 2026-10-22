@@ -186,6 +186,20 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
+    void set_logits_lowrank(struct llama_context * ctx, int idx) {
+        int32_t n_cand = 0;
+        const float * cand_ids_f = nullptr;
+        const float * lr_sub = llama_get_logits_lowrank_ith(ctx, idx, &cand_ids_f, &n_cand);
+        GGML_ASSERT(lr_sub != nullptr && cand_ids_f != nullptr && n_cand > 0);
+
+        cur.resize(n_cand);
+        for (int32_t i = 0; i < n_cand; i++) {
+            cur[i] = llama_token_data{(llama_token) cand_ids_f[i], lr_sub[i], 0.0f};
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
@@ -621,7 +635,7 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-static llama_token common_sampler_sample_impl(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first, bool subset) {
+static llama_token common_sampler_sample_impl(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first, int subset_mode) {
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
@@ -634,15 +648,17 @@ static llama_token common_sampler_sample_impl(struct common_sampler * gsmpl, str
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    if (subset) {
+    if (subset_mode == 1) {
         gsmpl->set_logits_subset(ctx, idx);
+    } else if (subset_mode == 2) {
+        gsmpl->set_logits_lowrank(ctx, idx);
     } else {
         gsmpl->set_logits(ctx, idx);
     }
 
     // the subset path never uses backend sampling (its chains stay detached
     // while the subset head is on), so this early-out is full-vocab only
-    if (!subset) {
+    if (subset_mode == 0) {
         // Check if a backend sampler has already sampled a token in which case we
         // return that token id directly.
         {
@@ -696,8 +712,10 @@ static llama_token common_sampler_sample_impl(struct common_sampler * gsmpl, str
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    if (subset) {
+    if (subset_mode == 1) {
         gsmpl->set_logits_subset(ctx, idx);
+    } else if (subset_mode == 2) {
+        gsmpl->set_logits_lowrank(ctx, idx);
     } else {
         gsmpl->set_logits(ctx, idx);
     }
@@ -718,13 +736,17 @@ static llama_token common_sampler_sample_impl(struct common_sampler * gsmpl, str
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, false);
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, 0);
 }
 
 // subset draft sampler for the MTP head: candidates carry vocab ids mapped
 // from subset positions. the verify sampler is untouched
 llama_token common_sampler_sample_subset(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, true);
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, 1);
+}
+
+llama_token common_sampler_sample_lowrank(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, 2);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {

@@ -17,6 +17,45 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
 
+// Two-stage low-rank SVD + exact top-k gather head for MTP drafting.
+// When packed_with_ids is true, returns [2 * k, n_outputs] with exact logits in [0..k-1]
+// and float-cast candidate token ids in [k..2*k-1]. When false (in-graph chain),
+// returns [k, n_outputs] exact logits and writes candidate ids [k, n_outputs] to *out_cand_ids.
+static inline ggml_tensor * build_mtp_lowrank_head(
+        llm_graph_context & g,
+        const llama_model & model,
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur,
+        bool packed_with_ids,
+        ggml_tensor ** out_cand_ids = nullptr) {
+    ggml_context * ctx0 = g.ctx0;
+    const int64_t k = g.cparams.spec_draft_lowrank_k;
+    const int64_t n_out = cur->ne[1];
+    const int64_t n_embd = head_w->ne[0];
+
+    ggml_tensor * z      = g.build_lora_mm(model.output_lowrank_down, cur);
+    ggml_tensor * scores = g.build_lora_mm(model.output_lowrank_scores, z);
+    ggml_tensor * cand   = ggml_top_k(ctx0, scores, k); // [k, n_out] I32
+    if (out_cand_ids) {
+        *out_cand_ids = cand;
+    }
+
+    ggml_tensor * cand_1d  = ggml_reshape_1d(ctx0, cand, k * n_out);
+    ggml_tensor * w_sub_3d = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, head_w, cand_1d), n_embd, k, n_out);
+    ggml_tensor * cur_3d   = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_out);
+    ggml_tensor * exact    = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, w_sub_3d, cur_3d), k, n_out);
+    if (head_s != nullptr) {
+        exact = ggml_mul(ctx0, exact, head_s);
+    }
+
+    if (!packed_with_ids) {
+        return exact;
+    }
+    ggml_tensor * cand_f = ggml_cast(ctx0, cand, GGML_TYPE_F32);
+    return ggml_concat(ctx0, exact, cand_f, 0);
+}
+
 //
 // base classes
 //

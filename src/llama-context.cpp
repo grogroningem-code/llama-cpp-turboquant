@@ -2,6 +2,7 @@
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-ext.h"
@@ -138,6 +139,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.embeddings_nextn_masked = false;
     cparams.mtp_chain               = false;
     cparams.spec_draft_subset       = 0;
+    cparams.spec_draft_lowrank_k    = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_arena_mib     = params.kv_stream_arena_mib;
     cparams.no_perf                 = params.no_perf;
@@ -2098,6 +2100,41 @@ float * llama_context::get_logits_subset_ith(int32_t i, int32_t * n_sub) {
     }
 }
 
+const float * llama_context::get_logits_lowrank_ith(int32_t i, const float ** ids_out, int32_t * n_cand) {
+    const int64_t k = (int64_t) cparams.spec_draft_lowrank_k;
+    if (n_cand) {
+        *n_cand = (int32_t) k;
+    }
+    if (ids_out) {
+        *ids_out = nullptr;
+    }
+
+    output_reorder();
+
+    try {
+        if (logits.data == nullptr) {
+            throw std::runtime_error("no logits");
+        }
+        if (k <= 0 || !model.output_lowrank_down || !model.output_lowrank_scores) {
+            throw std::runtime_error("lowrank head off");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        const float * row = logits.data + j * (2 * k);
+        if (ids_out) {
+            *ids_out = row + k;
+        }
+        return row;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid lowrank logits id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2524,6 +2561,148 @@ const int32_t * llama_context::spec_draft_vocab_ids(int32_t * n_ids) const {
     return model.output_subset_ids.empty() ? nullptr : model.output_subset_ids.data();
 }
 
+bool llama_context::set_spec_draft_lowrank(const char * path, int32_t n_candidates) {
+    const llama_model & model = this->model;
+
+    if (!path || path[0] == '\0' || n_candidates <= 0) {
+        cparams.spec_draft_lowrank_k = 0;
+        return true;
+    }
+    if (cparams.spec_draft_subset != 0) {
+        return false; // mutually exclusive with --spec-draft-vocab
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (n_candidates > n_vocab || 2 * (int64_t) n_candidates > n_vocab) {
+        return false;
+    }
+
+    const ggml_tensor * head = model.output;
+    for (auto & layer : model.layers) {
+        if (layer.nextn.eh_proj) {
+            if (layer.nextn.shared_head_head) {
+                head = layer.nextn.shared_head_head;
+            }
+            break;
+        }
+    }
+    if (!head && cparams.ctx_other) {
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        if (model_other) {
+            head = model_other->output;
+        }
+    }
+    if (!head || !head->buffer) {
+        return false;
+    }
+    const int64_t n_embd = head->ne[0];
+
+    auto * buft = ggml_backend_buffer_get_type(head->buffer);
+    if (!buft) {
+        return false;
+    }
+    {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+            auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+            if (get_extra) {
+                for (auto * eb = get_extra(cpu_dev); eb && *eb; ++eb) {
+                    if (*eb == buft) {
+                        LLAMA_LOG_ERROR("%s: output head uses a repack buffer type, rows cannot be gathered; retry with --no-repack\n", __func__);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    if (model.output_lowrank_down && model.output_lowrank_scores && model.output_lowrank_src == head) {
+        cparams.spec_draft_lowrank_k = (uint32_t) n_candidates;
+        return true;
+    }
+    if (model.output_lowrank_down || model.output_lowrank_scores) {
+        return false;
+    }
+
+    ggml_context * ctx_meta = nullptr;
+    gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx_meta };
+    gguf_context * ctx_gguf = gguf_init_from_file(path, gparams);
+    if (!ctx_gguf) {
+        LLAMA_LOG_ERROR("%s: failed to open lowrank GGUF '%s'\n", __func__, path);
+        return false;
+    }
+
+    ggml_tensor * m_down   = ggml_get_tensor(ctx_meta, "down");
+    ggml_tensor * m_scores = ggml_get_tensor(ctx_meta, "scores");
+    if (!m_down || !m_scores ||
+        m_down->ne[0] != n_embd || m_down->ne[1] <= 0 ||
+        m_scores->ne[0] != m_down->ne[1] || m_scores->ne[1] != n_vocab) {
+        LLAMA_LOG_ERROR("%s: invalid tensor shapes in '%s' (expected down [%lld, r], scores [r, %lld])\n",
+                __func__, path, (long long) n_embd, (long long) n_vocab);
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+
+    const int64_t r = m_down->ne[1];
+    ggml_init_params p = { 3 * ggml_tensor_overhead(), NULL, true };
+    ggml_context_ptr dev_ctx(ggml_init(p));
+    if (!dev_ctx) {
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+    ggml_tensor * t_down   = ggml_new_tensor_2d(dev_ctx.get(), m_down->type,   n_embd, r);
+    ggml_tensor * t_scores = ggml_new_tensor_2d(dev_ctx.get(), m_scores->type, r,      n_vocab);
+    ggml_set_name(t_down,   "output_lowrank_down");
+    ggml_set_name(t_scores, "output_lowrank_scores");
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(dev_ctx.get(), buft));
+    if (!buf) {
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    FILE * fp = fopen(path, "rb");
+    if (!fp) {
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+    auto read_and_upload = [&](ggml_tensor * meta, ggml_tensor * dst) -> bool {
+        const int tid = gguf_find_tensor(ctx_gguf, meta->name);
+        if (tid < 0) return false;
+        const size_t off = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, tid);
+        const size_t nb  = ggml_nbytes(meta);
+        std::vector<uint8_t> tmp(nb);
+        if (fseek(fp, (long) off, SEEK_SET) != 0 || fread(tmp.data(), 1, nb, fp) != nb) {
+            return false;
+        }
+        ggml_backend_tensor_set(dst, tmp.data(), 0, nb);
+        return true;
+    };
+
+    const bool ok = read_and_upload(m_down, t_down) && read_and_upload(m_scores, t_scores);
+    fclose(fp);
+    gguf_free(ctx_gguf);
+    ggml_free(ctx_meta);
+    if (!ok) {
+        return false;
+    }
+
+    model.output_lowrank_ctx.first  = std::move(dev_ctx);
+    model.output_lowrank_ctx.second = std::move(buf);
+    model.output_lowrank_down       = t_down;
+    model.output_lowrank_scores     = t_scores;
+    model.output_lowrank_src        = head;
+    cparams.spec_draft_lowrank_k    = (uint32_t) n_candidates;
+    return true;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2890,7 +3069,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         // chain mode: logits are [2, n_chain] (token_id, prob) pairs, not [n_vocab, n_tokens]
         // subset mode: logits are [n_sub, n_tokens] draft rows, not [n_vocab, n_tokens]
         const size_t logits_bytes =
-            (cparams.mtp_chain || cparams.spec_draft_subset) ? ggml_nbytes(t_logits) : (size_t) n_tokens * n_vocab * sizeof(float);
+            (cparams.mtp_chain || cparams.spec_draft_subset || cparams.spec_draft_lowrank_k) ? ggml_nbytes(t_logits) : (size_t) n_tokens * n_vocab * sizeof(float);
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, logits_bytes);
     }
 
@@ -3367,7 +3546,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(logits.data != nullptr);
 
             // chain keeps its historical stride; subset rows are n_sub wide
-            const size_t row_w = cparams.mtp_chain ? n_vocab : (cparams.spec_draft_subset ? t_logits->ne[0] : n_vocab);
+            const size_t row_w = cparams.mtp_chain ? n_vocab : ((cparams.spec_draft_subset || cparams.spec_draft_lowrank_k) ? t_logits->ne[0] : n_vocab);
             float * logits_out = logits.data + n_outputs_prev * row_w;
 
             if (n_outputs) {
@@ -3379,7 +3558,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     GGML_ASSERT(t_logits->ne[0] == 2);
                 }
                 const size_t extract_bytes =
-                    (cparams.mtp_chain || cparams.spec_draft_subset) ? ggml_nbytes(t_logits) : (size_t) n_outputs * n_vocab * sizeof(float);
+                    (cparams.mtp_chain || cparams.spec_draft_subset || cparams.spec_draft_lowrank_k) ? ggml_nbytes(t_logits) : (size_t) n_outputs * n_vocab * sizeof(float);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, extract_bytes);
             }
         }
@@ -3758,8 +3937,10 @@ void llama_context::output_reorder() {
             // subset rows are packed n_sub wide (see the subset extract path);
             // full-vocab stride would scramble them across rows
             const uint64_t row_w =
-                (cparams.spec_draft_subset && !model.output_subset_ids.empty())
-                ? (uint64_t) model.output_subset_ids.size() : n_vocab;
+                cparams.spec_draft_lowrank_k
+                ? (uint64_t) (2 * cparams.spec_draft_lowrank_k)
+                : ((cparams.spec_draft_subset && !model.output_subset_ids.empty())
+                    ? (uint64_t) model.output_subset_ids.size() : n_vocab);
             for (uint64_t k = 0; k < row_w; k++) {
                 std::swap(logits.data[i0 * row_w + k], logits.data[i1 * row_w + k]);
             }
@@ -5431,6 +5612,14 @@ const int32_t * llama_spec_draft_vocab_ids(llama_context * ctx, int32_t * n_ids)
 
 float * llama_get_logits_subset_ith(llama_context * ctx, int32_t i, int32_t * n_sub) {
     return ctx->get_logits_subset_ith(i, n_sub);
+}
+
+bool llama_set_spec_draft_lowrank(llama_context * ctx, const char * path, int32_t n_candidates) {
+    return ctx->set_spec_draft_lowrank(path, n_candidates);
+}
+
+const float * llama_get_logits_lowrank_ith(llama_context * ctx, int32_t i, const float ** ids_out, int32_t * n_cand) {
+    return ctx->get_logits_lowrank_ith(i, ids_out, n_cand);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

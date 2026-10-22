@@ -743,8 +743,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         head_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(head_w, cur, head_s);
-    cb(cur, "result_output", -1);
+    GGML_ASSERT(params.cparams.spec_draft_subset == 0 || model.output_subset_active(params.cparams.spec_draft_subset, head_w));
+    GGML_ASSERT(params.cparams.spec_draft_lowrank_k == 0 || model.output_lowrank_active(params.cparams.spec_draft_lowrank_k, head_w));
+    if (model.output_lowrank_active(params.cparams.spec_draft_lowrank_k, head_w)) {
+        cur = build_mtp_lowrank_head(*this, model, head_w, head_s, cur, true);
+        cb(cur, "result_output_lowrank", -1);
+    } else if (model.output_subset_active(params.cparams.spec_draft_subset, head_w)) {
+        cur = build_lora_mm(model.output_subset_w, cur, model.output_subset_s);
+        cb(cur, "result_output_subset", -1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+        cb(cur, "result_output", -1);
+    }
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);

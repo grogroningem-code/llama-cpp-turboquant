@@ -150,6 +150,14 @@ LLAMA_API const int32_t * llama_spec_draft_vocab_ids(struct llama_context * ctx,
 // debug builds).
 LLAMA_API float * llama_get_logits_subset_ith(struct llama_context * ctx, int32_t i, int32_t * n_sub);
 
+// Install a low-rank SVD sidecar GGUF (tensors "down" [n_embd, r] and "scores" [r, n_vocab])
+// on an MTP draft context with top-k candidate selection (null/<=0 disarms it).
+// Packed output row per token is [2 * k] floats: k exact candidate logits followed by k float-cast candidate token ids.
+LLAMA_API bool llama_set_spec_draft_lowrank(struct llama_context * ctx, const char * path, int32_t n_candidates);
+
+// Low-rank draft head row for token i: returns packed [n_cand] exact logits and sets *ids_out to the [n_cand] float-cast token ids.
+LLAMA_API const float * llama_get_logits_lowrank_ith(struct llama_context * ctx, int32_t i, const float ** ids_out, int32_t * n_cand);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

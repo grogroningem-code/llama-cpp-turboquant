@@ -70,6 +70,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // but candidates come from the packed subset-logits row with vocab ids mapped
 // from subset positions. the verify path keeps common_sampler_sample
 llama_token common_sampler_sample_subset(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+llama_token common_sampler_sample_lowrank(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
 //

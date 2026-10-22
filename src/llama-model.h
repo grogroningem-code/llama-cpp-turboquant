@@ -635,6 +635,17 @@ struct llama_model {
                output_subset_w != nullptr && head_w == output_subset_src;
     }
 
+    // MTP low-rank SVD sidecar head: down [n_embd, r] and scores [r, n_vocab]
+    mutable std::pair<ggml_context_ptr, ggml_backend_buffer_ptr> output_lowrank_ctx;
+    mutable struct ggml_tensor * output_lowrank_down   = nullptr;
+    mutable struct ggml_tensor * output_lowrank_scores = nullptr;
+    mutable const struct ggml_tensor * output_lowrank_src = nullptr;
+
+    bool output_lowrank_active(uint32_t want_k, const struct ggml_tensor * head_w) const {
+        return want_k > 0 && output_lowrank_down != nullptr &&
+               output_lowrank_scores != nullptr && head_w == output_lowrank_src;
+    }
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;

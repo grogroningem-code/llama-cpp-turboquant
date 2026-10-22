@@ -98,6 +98,7 @@ struct llama_context {
     // subset row for the MTP draft head: packed [n_sub] row, ids from
     // spec_draft_vocab_ids. null/0 count when the subset head is off.
     float * get_logits_subset_ith(int32_t i, int32_t * n_sub);
+    const float * get_logits_lowrank_ith(int32_t i, const float ** ids_out, int32_t * n_cand);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -141,6 +142,7 @@ struct llama_context {
     bool set_spec_draft_vocab(const int32_t * ids, int32_t n_ids);
     // installed subset id list, or null when off
     const int32_t * spec_draft_vocab_ids(int32_t * n_ids) const;
+    bool set_spec_draft_lowrank(const char * path, int32_t n_candidates);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
