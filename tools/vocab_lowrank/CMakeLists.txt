@@ -1,0 +1,7 @@
+set(TARGET llama-vocab-lowrank)
+add_executable(${TARGET} vocab_lowrank.cpp vocab_lowrank_svd.cpp)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
