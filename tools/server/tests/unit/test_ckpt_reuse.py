@@ -6,7 +6,7 @@ from utils import *
 #
 # tinygemma3's sliding window (4096) is longer than this context (1024), so the window never slides: the server
 # restores a checkpoint on rollback only because its pruning threshold (pos_next - n_swa) clamps to 0. If the
-# server learns to skip that restore, this test fails loudly with "restored no checkpoint". Because nothing is
+# server learns to skip that restore, this test fails with "expected one checkpoint restore, found 0". As nothing is
 # pruned, a checkpoint's size grows with the prompt, so the reused buffer here (from an erased, longer checkpoint)
 # is larger than the data saved into it.
 #
