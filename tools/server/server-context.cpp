@@ -1150,8 +1150,19 @@ private:
     static constexpr size_t ckpt_spare_max = 4;
 
     void ckpt_recycle(common_prompt_checkpoint & ckpt) {
-        if (ckpt_spare.size() < ckpt_spare_max && !ckpt.data_tgt.empty()) {
+        if (ckpt.data_tgt.empty()) {
+            return;
+        }
+        if (ckpt_spare.size() < ckpt_spare_max) {
             ckpt_spare.push_back(std::move(ckpt.data_tgt));
+            return;
+        }
+        // full: a larger buffer replaces the smallest spare, so the small buffers of a short chat
+        // cannot keep the list full of buffers too small for any later checkpoint
+        auto smallest = std::min_element(ckpt_spare.begin(), ckpt_spare.end(),
+                [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) { return a.capacity() < b.capacity(); });
+        if (smallest->capacity() < ckpt.data_tgt.capacity()) {
+            *smallest = std::move(ckpt.data_tgt);
         }
     }
 
@@ -2827,7 +2838,8 @@ private:
             // take the largest spare, and only if it fits: a smaller one would reallocate and copy on resize
             auto best = std::max_element(ckpt_spare.begin(), ckpt_spare.end(),
                     [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) { return a.capacity() < b.capacity(); });
-            if (best->capacity() >= llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            const size_t need = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (need > 0 && best->capacity() >= need) {
                 cur.data_tgt = std::move(*best);
                 ckpt_spare.erase(best);
                 SLT_TRC(slot, "reusing a spare context checkpoint buffer (%zu spare left)\n", ckpt_spare.size());
