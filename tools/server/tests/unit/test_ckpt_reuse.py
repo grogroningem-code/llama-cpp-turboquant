@@ -1,58 +1,88 @@
+import os
 import re
+import tempfile
 import pytest
 from utils import *
 
-# A rolled-back turn must answer the same when the context checkpoint it restores was saved into
-# a reused buffer (the buffer of an erased checkpoint) as when the prompt is read from scratch.
-# tinygemma3 has sliding-window layers, so each rollback here restores a checkpoint.
-
-server = ServerPreset.tinygemma3()
+# A context checkpoint saved into a reused buffer (the buffer of an erased checkpoint) must restore the same state
+# as one saved into a new buffer. tinygemma3 has sliding-window layers, so rolling back restores a checkpoint.
+#
+# The control is the same conversation on a fresh server, where the restored checkpoint sits in a new buffer.
+# Both runs read every prompt in the same batches, so their outputs must match exactly on any backend. (Comparing
+# with the prompt read from scratch would not work: after a restore the server re-reads the checkpoint's last
+# token in a batch of its own, and that alone moves this model's logprobs by about 0.05, as much as a corrupted
+# buffer does.)
 
 NOTES = " ".join(f"Entry {i}: the guard at gate {i % 7} saw trader {i * 7 % 11} sell {i % 5} bottles on day {i}."
                  for i in range(24))
+QUESTION = "\nQuestion: how many bottles did trader {} sell?\nAnswer:"
 
 
-@pytest.fixture(autouse=True)
-def create_server():
-    global server
+def start_server():
     server = ServerPreset.tinygemma3()
     server.temperature = 0.0
     server.n_slots = 1
+    server.n_ctx = 1024
+    server.n_batch = 32
     server.debug = True  # --verbose: the buffer reuse line is trace level
-    server.log_path = "./tmp/test_ckpt_reuse.log"
+    fd, server.log_path = tempfile.mkstemp(prefix="test_ckpt_reuse_", suffix=".log")
+    os.close(fd)
+    server.start()
+    return server
 
 
-def complete(prompt, n_predict, cache_prompt=True):
+def complete(server, prompt, n_predict):
+    # n_probs: tinygemma3 prints the same token whatever the state, so the probabilities carry the comparison
     res = server.make_request("POST", "/completion", data={
-        "prompt": prompt, "n_predict": n_predict, "id_slot": 0, "cache_prompt": cache_prompt, "n_probs": 5,
+        "prompt": prompt, "n_predict": n_predict, "id_slot": 0, "cache_prompt": True, "n_probs": 5,
     })
     assert res.status_code == 200
     return res.body
 
 
+def run(with_spares):
+    server = start_server()
+    try:
+        if with_spares:
+            # a different chat: the next turn reads its prompt from the start and erases both of these
+            # checkpoints, so their buffers become spares that the next checkpoints are saved into
+            complete(server, "Ignore this. " + NOTES + QUESTION.format(1), 4)
+        complete(server, NOTES + QUESTION.format(1), 4)
+        # rolls back to the last checkpoint before the question's changed digit and restores it
+        last = complete(server, NOTES + QUESTION.format(2), 16)
+    finally:
+        server.stop()
+    with open(server.log_path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    os.remove(server.log_path)
+    return last, lines
+
+
+def restored_index(lines):
+    i = next((i for i, l in enumerate(lines) if "restored context checkpoint" in l), None)
+    assert i is not None, "the last turn restored no checkpoint"
+    return i
+
+
 def test_restore_from_reused_checkpoint_buffer():
-    global server
-    server.start()
-    complete(NOTES + "\nQuestion: list every entry about gate 3.\nAnswer:", 200)
-    # rolls back into the notes: restores a checkpoint, erases the newer one and saves the next into its buffer
-    complete(NOTES + "\nQuestion: which trader came most often?\nAnswer:", 200)
-    # rolls back again: restores the checkpoint saved into the reused buffer
-    last = NOTES + "\nQuestion: how many bottles in all?\nAnswer:"
-    restored = complete(last, 64)
-    cold = complete(last, 64, cache_prompt=False)
-    server.stop()
+    reused, lines = run(with_spares=True)
+    i_restore = restored_index(lines)
+    pos_max = re.search(r"restored context checkpoint \(pos_min = \d+, pos_max = (\d+),", lines[i_restore]).group(1)
+    # the restored checkpoint must be one that was saved into a reused buffer: the "created" line right after a
+    # "reusing" line, with the restored position
+    reused_saves = []
+    for i, l in enumerate(lines[:i_restore]):
+        if "reusing a spare context checkpoint buffer" in l:
+            created = next((m for m in lines[i + 1:i_restore] if "created context checkpoint" in m), None)
+            if created is not None:
+                reused_saves.append(re.search(r"pos_max = (\d+),", created).group(1))
+    assert pos_max in reused_saves, f"the restored checkpoint (pos_max {pos_max}) was not saved into a reused buffer"
 
-    lines = open(server.log_path).read().splitlines()
-    reuse = [i for i, l in enumerate(lines) if "reusing a spare context checkpoint buffer" in l]
-    assert reuse, "no checkpoint was saved into a reused buffer"
-    # the checkpoint created right after the first reuse, and its restore by the last turn
-    created = next(re.search(r"created context checkpoint .*pos_max = (\d+)", l)
-                   for l in lines[reuse[0]:] if "created context checkpoint" in l)
-    pos_max = created.group(1)
-    assert any(re.search(rf"restored context checkpoint \(pos_min = \d+, pos_max = {pos_max},", l)
-               for l in lines[reuse[0]:]), f"the checkpoint in the reused buffer (pos_max {pos_max}) was never restored"
+    fresh, lines = run(with_spares=False)
+    i_restore = restored_index(lines)
+    assert not any("reusing a spare context checkpoint buffer" in l for l in lines[:i_restore]), \
+        "the control's restored checkpoint should be in a new buffer"
 
-    assert restored["timings"]["prompt_n"] < 64          # the restored turn read only the tail
-    assert cold["timings"]["prompt_n"] > 500             # the control read the whole prompt
-    assert restored["content"] == cold["content"]
-    assert restored["completion_probabilities"] == cold["completion_probabilities"]
+    assert reused["timings"]["prompt_n"] < 64  # the restored turn read only the tail
+    assert reused["content"] == fresh["content"]
+    assert reused["completion_probabilities"] == fresh["completion_probabilities"]
