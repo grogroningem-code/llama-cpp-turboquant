@@ -81,7 +81,29 @@ int main(int argc, char ** argv) {
     // 0.20.20.20.2....
     llama_memory_t mem = llama_get_memory(ctx);
     llama_memory_seq_rm(mem, 1, -1, -1);
-    fprintf(stderr, "%s : cleared seq 1 to create fragmentation\n", __func__);
+
+    // seq_rm frees the cells but leaves their bytes: refill the holes with other tokens and clear them again, so
+    // that the restore below has to write every row, and a row written elsewhere leaves a wrong byte behind
+    common_batch_clear(batch);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        common_batch_add(batch, (llama_token) (5000 + 7*i), i, {1}, false);
+    }
+    batch.logits[batch.n_tokens - 1] = true;
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to refill the holes\n", __func__);
+        return 1;
+    }
+    llama_memory_seq_rm(mem, 1, -1, -1);
+    fprintf(stderr, "%s : cleared seq 1 to create fragmentation (holes refilled and cleared)\n", __func__);
+
+    // the neighbours must not change: a restore into wrong cells overwrites them
+    auto save_seq = [&](llama_seq_id s) {
+        std::vector<uint8_t> st(llama_state_seq_get_size(ctx, s));
+        st.resize(llama_state_seq_get_data(ctx, st.data(), st.size(), s));
+        return st;
+    };
+    const std::vector<uint8_t> seq0_before = save_seq(0);
+    const std::vector<uint8_t> seq2_before = save_seq(2);
 
     // Now the cache has holes where seq 1 was
     // This creates fragmentation - there's no contiguous block large enough
@@ -109,6 +131,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "%s : re-saved seq 1 matches the restored state byte for byte\n", __func__);
+    if (save_seq(0) != seq0_before || save_seq(2) != seq2_before) {
+        fprintf(stderr, "%s : FAILED: the restore of seq 1 changed seq 0 or seq 2\n", __func__);
+        llama_batch_free(batch);
+        return 1;
+    }
+    fprintf(stderr, "%s : seq 0 and seq 2 unchanged by the restore\n", __func__);
 
     // Verify we can decode with the restored state
     // Generate one token to verify the restored state is usable

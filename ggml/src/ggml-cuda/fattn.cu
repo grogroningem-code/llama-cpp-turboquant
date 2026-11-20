@@ -2675,10 +2675,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
 // ---------------------------------------------------------------------------
 // turbo4 fused MMA decode dispatch (mirrors the f16 switch helpers, type-parametric).
-// Only reached from the fused gate in ggml_cuda_flash_attn_ext (turbo KV decode, Q->ne[1] <= 4, turing MMA; which
-// pairs at which head dims: turbo56_matched and turbo234_matched there).
+// Only reached from the fused gate in ggml_cuda_flash_attn_ext (turbo KV decode, Q->ne[1] <= ggml_cuda_turbo_mma_fused_max_q(),
+// default 4, turing MMA; which pairs at which head dims: turbo56_matched and turbo234_matched there). Batches above
+// ncols1 run as several column tiles of the largest instance (launch_fattn tiles Q->ne[1]).
 //
-// The reachable (ncols1, ncols2) set for Q->ne[1] in {1..4} with GQA-packing is exactly
+// The reachable (ncols1, ncols2) set for any Q->ne[1] with GQA-packing is exactly
 // {(1,8),(2,8),(4,8),(2,4),(4,4),(4,2),(8,1)} — the 7 compiled instances per D. Each ncols2
 // has an explicit dispatcher so ONLY those pairs are instantiated (an unguarded ncols1=8/ncols2
 // fallthrough would also instantiate uncompiled cases like (8,4) -> link error).
@@ -3542,7 +3543,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
 
     // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
-    // Routes turbo KV decode (Q->ne[1] <= 4, Turing+ MMA) for the pairs and head dims in turbo56_matched and
+    // Routes turbo KV decode (Q->ne[1] <= GGML_TURBO_MMA_FUSED_MAX_Q, default 4, Turing+ MMA) for the pairs and head dims in turbo56_matched and
     // turbo234_matched onto the GQA-packed MMA path (KV read once per head-group instead of per query head). Q is
     // ALREADY graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
     // path does NO inline FWHT and NO src swap. GGML_TURBO_MMA_FUSED=0 falls straight through

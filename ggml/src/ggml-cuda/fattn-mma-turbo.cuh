@@ -103,7 +103,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     template void ggml_cuda_flash_attn_ext_mma_turbo_case                           \
     <DKQ, DV, ncols1, ncols2, tK, tV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
-// The reachable (ncols1, ncols2) set for Q->ne[1] in {1..4} with turing_mma_available
+// The reachable (ncols1, ncols2) set for any Q->ne[1] with turing_mma_available
 // is exactly: (1,8),(2,8),(4,8),(2,4),(4,4),(4,2),(8,1). Declare those externs only.
 #define DECL_FATTN_MMA_TURBO_ALL(DKQ, DV, tK, tV)        \
     extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, 1, 8, tK, tV); \
