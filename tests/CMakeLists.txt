@@ -322,7 +322,7 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
-llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}" -fa on)
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 # flash attention off: V is stored transposed, the other restore branch
 llama_test(test-state-restore-fragmented NAME test-state-restore-fragmented-nofa LABEL "model" ARGS -m "${MODEL_DEST}" -fa off)

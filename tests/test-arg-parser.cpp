@@ -231,6 +231,15 @@ static void test(void) {
     assert(dub_chain_dft.n_ubatch == 16);
     assert(dub_chain_dft.n_batch == 16);
 
+    // only n_batch below the chain length: n_batch is raised, the larger draft ubatch is kept
+    argv = {"binary_name", "-m", "model_file.gguf", "-b", "8", "--spec-chain", "16", "--spec-draft-n-ubatch", "32"};
+    common_params dub_chain_b;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dub_chain_b, LLAMA_EXAMPLE_SERVER));
+    dub_chain_b.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    const common_params dub_chain_b_dft = common_base_params_to_speculative(dub_chain_b);
+    assert(dub_chain_b_dft.n_batch == 16);
+    assert(dub_chain_b_dft.n_ubatch == 32);
+
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-chain", "0"};
     common_params no_chain_params;
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), no_chain_params, LLAMA_EXAMPLE_SPECULATIVE));
