@@ -2873,6 +2873,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.kv_stream_arena_mib = 0;
     result.n_outputs_max = params.n_parallel;
 
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+
     // chained MTP drafting outputs logits for every chain step in one decode
     if (common_speculative_mtp_chain_enabled(params_spec)) {
         const int32_t per_seq = std::max(1, params_spec.n_max);
