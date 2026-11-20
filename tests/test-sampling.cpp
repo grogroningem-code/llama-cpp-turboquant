@@ -305,7 +305,8 @@ static bool top_k_unique(const std::vector<float> & logits, int32_t k) {
 }
 
 static void test_top_k_logits(const std::vector<float> & logits, int32_t k, bool expect_ok) {
-    std::vector<llama_token_data> out;
+    // shared across calls, so every call starts from a dirty vector, as set_logits does with its cur
+    static std::vector<llama_token_data> out;
     const bool ok = common_sampler_top_k_logits(logits.data(), (int32_t) logits.size(), k, out);
     if (ok != expect_ok) {
         fprintf(stderr, "top-k logits n=%zu k=%d: got %d, want %d\n", logits.size(), k, ok, expect_ok);
@@ -448,6 +449,22 @@ static void test_top_k_logits() {
         }
         test_top_k_logits(big, 128, true);
         test_top_k_logits(big, 129, false);
+    }
+
+    // k = -1, +inf at the top and a tie of two +inf, NaN in a tail block shorter than 64
+    {
+        std::vector<float> l(200);
+        for (int32_t i = 0; i < 200; ++i) {
+            l[i] = -(float) i;
+        }
+        test_top_k_logits(l, -1, false);
+        l[150] = INFINITY;
+        test_top_k_logits(l, 20, true);
+        l[170] = INFINITY;
+        test_top_k_logits(l, 20, false);
+        l[170] = -170.0f;
+        l[199] = std::numeric_limits<float>::quiet_NaN();
+        test_top_k_logits(l, 20, false);
     }
 }
 
