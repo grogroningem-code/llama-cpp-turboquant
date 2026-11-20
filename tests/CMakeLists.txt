@@ -154,7 +154,7 @@ llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
-    llama_build_and_test(test-sampling.cpp)
+    llama_build_and_test(test-sampling.cpp test-sampling-top-k.cpp)
     llama_build_and_test(test-drama3-rope.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -324,8 +324,11 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
-llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}" -fa on)
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
+# flash attention off: V is stored transposed, the other restore branch
+llama_test(test-state-restore-fragmented NAME test-state-restore-fragmented-nofa LABEL "model" ARGS -m "${MODEL_DEST}" -fa off)
+set_tests_properties(test-state-restore-fragmented-nofa PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")

@@ -1149,6 +1149,31 @@ private:
     common_params params_base;
     common_params params_load;
 
+    // Target-state buffers of erased context checkpoints, reused by the next checkpoint. Saving a
+    // checkpoint into a fresh buffer allocates and zero-fills it first (about 37 ms for the 64 MiB
+    // sliding-window state of a 26B model), which is most of the cost of a short appended turn.
+    // The state copy overwrites every byte (update_tgt aborts on a short write), so a reused
+    // buffer never leaks old data. At most ckpt_spare_max buffers are kept.
+    std::vector<std::vector<uint8_t>> ckpt_spare;
+    static constexpr size_t ckpt_spare_max = 4;
+
+    void ckpt_recycle(common_prompt_checkpoint & ckpt) {
+        if (ckpt.data_tgt.empty()) {
+            return;
+        }
+        if (ckpt_spare.size() < ckpt_spare_max) {
+            ckpt_spare.push_back(std::move(ckpt.data_tgt));
+            return;
+        }
+        // full: a larger buffer replaces the smallest spare, so the small buffers of a short chat
+        // cannot keep the list full of buffers too small for any later checkpoint
+        auto smallest = std::min_element(ckpt_spare.begin(), ckpt_spare.end(),
+                [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) { return a.capacity() < b.capacity(); });
+        if (smallest->capacity() < ckpt.data_tgt.capacity()) {
+            *smallest = std::move(ckpt.data_tgt);
+        }
+    }
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -2788,6 +2813,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                ckpt_recycle(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2803,6 +2829,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            ckpt_recycle(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2815,6 +2842,17 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        if (ctx_tgt != nullptr && !ckpt_spare.empty()) {
+            // take the largest spare, and only if it fits: a smaller one would reallocate and copy on resize
+            auto best = std::max_element(ckpt_spare.begin(), ckpt_spare.end(),
+                    [](const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) { return a.capacity() < b.capacity(); });
+            const size_t need = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (need > 0 && best->capacity() >= need) {
+                cur.data_tgt = std::move(*best);
+                ckpt_spare.erase(best);
+                SLT_TRC(slot, "reusing a spare context checkpoint buffer (%zu spare left)\n", ckpt_spare.size());
+            }
+        }
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
@@ -3873,6 +3911,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        ckpt_recycle(*it);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;

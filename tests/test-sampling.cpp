@@ -267,6 +267,9 @@ static void test_sampler_queue(const size_t n_vocab, const std::string & sampler
            samplers_sequence.c_str(), n_vocab, top_k, top_p, min_p);
 }
 
+// common_sampler_top_k_logits cases, in test-sampling-top-k.cpp
+void test_top_k_logits();
+
 static void bench(llama_sampler * cnstr, const char * cnstr_name, const std::vector<llama_token_data> & data, int n_iter) {
     std::vector<llama_token_data> cur(data.size());
     std::copy(data.begin(), data.end(), cur.begin());
@@ -391,6 +394,8 @@ int main(void) {
     test_sampler_queue(10000, "pmk", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
+
+    test_top_k_logits();
 
     printf("OK\n");
 

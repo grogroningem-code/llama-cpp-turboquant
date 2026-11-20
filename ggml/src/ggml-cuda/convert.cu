@@ -348,27 +348,20 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
-// turbo3/turbo4/turbo5/turbo6 -> f16, a half-warp per 128-value block, 8 values per lane. The generic path above
+// turbo3/4/5/6 -> f16, a half-warp per 128-value block, 8 values per lane. The generic path above
 // reads the centroid table from __constant__ memory with per-thread indices, which serializes;
-// here each lane holds table entries in registers and lookups are warp shuffles.
+// here each lane holds a table entry in a register and lookups are warp shuffles.
+// turbo5 has 32 centroids (one per lane), turbo6 has 64 (two per lane: c for codes 0-31, c_hi for 32-63).
 template <ggml_type type>
 static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half * __restrict__ y,
         const uint32_t nblk, const uint3 nbr, const uint3 ne01, const uint3 ne02,
         const int64_t s01, const int64_t s02, const int64_t s03) {
     const int lane = threadIdx.x;
     const int l    = lane % 16;
-    float c_lo;
-    [[maybe_unused]] float c_hi = 0.0f;
-    if constexpr (type == GGML_TYPE_TURBO6_0) {
-        c_lo = TURBO6_CENTROIDS[lane];
-        c_hi = TURBO6_CENTROIDS[32 + lane];
-    } else if constexpr (type == GGML_TYPE_TURBO5_0) {
-        c_lo = TURBO5_CENTROIDS[16 + lane % 16]; // magnitudes; c[15-m] == -c[16+m]
-    } else if constexpr (type == GGML_TYPE_TURBO3_0) {
-        c_lo = TURBO_CENTROIDS_3BIT[lane % 8];
-    } else {
-        c_lo = TURBO_CENTROIDS_4BIT[lane % 16];
-    }
+    const float c  = type == GGML_TYPE_TURBO3_0 ? TURBO_CENTROIDS_3BIT[lane % 8] :
+                     type == GGML_TYPE_TURBO4_0 ? TURBO_CENTROIDS_4BIT[lane % 16] :
+                     type == GGML_TYPE_TURBO5_0 ? TURBO5_CENTROIDS[lane % 32] : TURBO6_CENTROIDS[lane % 32];
+    [[maybe_unused]] const float c_hi = type == GGML_TYPE_TURBO6_0 ? TURBO6_CENTROIDS[32 + lane % 32] : 0.0f;
 
     // The loop bound is warp-uniform so every lane reaches the shuffles.
     for (uint32_t w = blockIdx.x*blockDim.y + threadIdx.y; 2*w < nblk; w += gridDim.x*blockDim.y) {
@@ -381,28 +374,29 @@ static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half
         const uint2 r2  = fast_div_modulo(r1.x, ne02);  // x = i03, y = i02
         const int64_t src = r2.x*s03 + r2.y*s02 + r1.y*s01 + row.y;
 
-        uint32_t qs;       // turbo4/5/6: 8 nibbles, element m at bits 4m; turbo3: low 2 bits of element m at bits 2m
-        [[maybe_unused]] uint32_t qh = 0; // turbo6: 2-bit high part of element m at bits 2m; turbo5: sign at bit m; turbo3: high bit of element m at bit m
+        uint32_t qs;       // turbo4/5/6: low 4 bits of element m at bits 4m; turbo3: low 2 bits of element m at bits 2m
+        [[maybe_unused]] uint32_t hi = 0; // turbo3: high bit of element m at bit m; turbo5: sign bit m; turbo6: high 2 bits at bits 2m
         float norm;
-        if constexpr (type == GGML_TYPE_TURBO6_0) {
-            const block_turbo6_0 * b = (const block_turbo6_0 *) vx + src;
+        if constexpr (type == GGML_TYPE_TURBO3_0) {
+            const block_turbo3_0 * b = (const block_turbo3_0 *) vx + src;
+            qs   = *(const uint16_t *) (b->qs + 2*l);
+            hi   = b->signs[l];
+            norm = __half2float(b->norm);
+        } else if constexpr (type == GGML_TYPE_TURBO4_0) {
+            static_assert(sizeof(block_turbo4_0) == 66, "4-bit turbo4 layout expected");
+            const block_turbo4_0 * b = (const block_turbo4_0 *) vx + src;
             qs   = uint32_t(*(const uint16_t *) (b->qs + 4*l)) | (uint32_t(*(const uint16_t *) (b->qs + 4*l + 2)) << 16);
-            qh   = *(const uint16_t *) (b->qh + 2*l);
             norm = __half2float(b->norm);
         } else if constexpr (type == GGML_TYPE_TURBO5_0) {
             const block_turbo5_0 * b = (const block_turbo5_0 *) vx + src;
             qs   = uint32_t(*(const uint16_t *) (b->qs + 4*l)) | (uint32_t(*(const uint16_t *) (b->qs + 4*l + 2)) << 16);
-            qh   = b->qh[l];
-            norm = __half2float(b->norm);
-        } else if constexpr (type == GGML_TYPE_TURBO3_0) {
-            const block_turbo3_0 * b = (const block_turbo3_0 *) vx + src;
-            qs   = *(const uint16_t *) (b->qs + 2*l);
-            qh   = b->signs[l];
+            hi   = b->qh[l];
             norm = __half2float(b->norm);
         } else {
-            static_assert(sizeof(block_turbo4_0) == 66, "4-bit turbo4 layout expected");
-            const block_turbo4_0 * b = (const block_turbo4_0 *) vx + src;
+            static_assert(type == GGML_TYPE_TURBO6_0, "unsupported turbo type");
+            const block_turbo6_0 * b = (const block_turbo6_0 *) vx + src;
             qs   = uint32_t(*(const uint16_t *) (b->qs + 4*l)) | (uint32_t(*(const uint16_t *) (b->qs + 4*l + 2)) << 16);
+            hi   = *(const uint16_t *) (b->qh + 2*l);
             norm = __half2float(b->norm);
         }
 
@@ -413,18 +407,18 @@ static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half
 #pragma unroll
             for (int k = 0; k < 2; ++k) {
                 if constexpr (type == GGML_TYPE_TURBO6_0) {
-                    const int idx = ((qs >> (4*(m + k))) & 0xF) | (((qh >> (2*(m + k))) & 0x3) << 4);
-                    const float lo = __shfl_sync(0xFFFFFFFF, c_lo, idx & 31, 32);
-                    const float hi = __shfl_sync(0xFFFFFFFF, c_hi, idx & 31, 32);
-                    v[k] = (idx & 32 ? hi : lo) * norm;
-                } else if constexpr (type == GGML_TYPE_TURBO5_0) {
-                    const float mag = __shfl_sync(0xFFFFFFFF, c_lo, (qs >> (4*(m + k))) & 0xF, 32);
-                    v[k] = ((qh >> (m + k)) & 1 ? -mag : mag) * norm;
-                } else if constexpr (type == GGML_TYPE_TURBO3_0) {
-                    const int idx = ((qs >> (2*(m + k))) & 0x3) | (((qh >> (m + k)) & 1) << 2);
-                    v[k] = __shfl_sync(0xFFFFFFFF, c_lo, idx, 32) * norm;
+                    // codes 0-31 come from c, 32-63 from c_hi; both shuffles run on every lane
+                    const int code = ((qs >> (4*(m + k))) & 0xF) | (((hi >> (2*(m + k))) & 0x3) << 4);
+                    const float lo_v = __shfl_sync(0xFFFFFFFF, c,    code & 31, 32);
+                    const float hi_v = __shfl_sync(0xFFFFFFFF, c_hi, code & 31, 32);
+                    v[k] = (code < 32 ? lo_v : hi_v) * norm;
                 } else {
-                    v[k] = __shfl_sync(0xFFFFFFFF, c_lo, (qs >> (4*(m + k))) & 0xF, 32) * norm;
+                    const int idx = type == GGML_TYPE_TURBO3_0 ?
+                        ((qs >> (2*(m + k))) & 0x3) | (((hi >> (m + k)) & 1) << 2) :
+                        type == GGML_TYPE_TURBO5_0 ?
+                        turbo5_sm_to_code((qs >> (4*(m + k))) & 0xF, (hi >> (m + k)) & 1) :
+                        (qs >> (4*(m + k))) & 0xF;
+                    v[k] = __shfl_sync(0xFFFFFFFF, c, idx, 32) * norm;
                 }
             }
             out[m/2] = __floats2half2_rn(v[0], v[1]);
