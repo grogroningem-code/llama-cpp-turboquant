@@ -2,6 +2,7 @@
 #include "common.h"
 #include "download.h"
 #include "llama.h"
+#include "speculative.h"
 
 #include <cstdlib>
 #include <string>
@@ -193,6 +194,23 @@ static void test(void) {
     assert(chain_ctx_params.n_rs_seq == 8);
     assert(chain_ctx_params.n_batch == 10);
     assert(chain_ctx_params.n_ubatch == 10);
+
+    // --spec-draft-n-ubatch: negative rejected, 0 keeps the target's n_ubatch, N sets only the draft context's
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-ubatch", "-1"};
+    common_params dub_bad;
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), dub_bad, LLAMA_EXAMPLE_SERVER));
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-ub", "1024"};
+    common_params dub_default;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dub_default, LLAMA_EXAMPLE_SERVER));
+    assert(dub_default.speculative.draft.n_ubatch == 0);
+    assert(common_base_params_to_speculative(dub_default).n_ubatch == 1024);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-ub", "1024", "--spec-draft-n-ubatch", "64"};
+    common_params dub_set;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dub_set, LLAMA_EXAMPLE_SERVER));
+    assert(common_base_params_to_speculative(dub_set).n_ubatch == 64);
+    assert(dub_set.n_ubatch == 1024);
 
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-chain", "0"};
     common_params no_chain_params;

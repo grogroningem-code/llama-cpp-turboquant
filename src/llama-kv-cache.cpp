@@ -3242,6 +3242,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             runs.push_back({ (uint32_t) idxs[i0], (uint32_t) idxs[i1 - 1] + 1 });
             i0 = i1;
         }
+        if (runs.size() > 1) {
+            LLAMA_LOG_INFO("%s: restoring %u cells in %zu runs\n", __func__, cell_count, runs.size());
+        }
     }
 
     uint32_t v_trans;

@@ -1046,6 +1046,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
             llama_set_causal_attn(ctx_dft, causal);
+
+            // draft() decodes every drafting sequence's block in one llama_decode; with non-causal attention that
+            // batch must fit in one ubatch, or llama_decode aborts mid-generation
+            const uint32_t n_block_all = n_seq * (uint32_t) (this->params.n_max + (is_dspark ? 0 : 1));
+            if (!causal && llama_n_ubatch(ctx_dft) < n_block_all) {
+                throw std::runtime_error("DFlash/DSpark drafting needs a draft n_ubatch of at least " +
+                    std::to_string(n_block_all) + " (" + std::to_string(n_seq) + " sequences x block), got " +
+                    std::to_string(llama_n_ubatch(ctx_dft)) + "; raise --spec-draft-n-ubatch");
+            }
         }
     }
 
@@ -2881,6 +2890,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (common_speculative_mtp_chain_enabled(params_spec)) {
         const int32_t per_seq = std::max(1, params_spec.n_max);
         result.n_outputs_max = std::max(result.n_outputs_max, params.n_parallel * per_seq);
+        // the chain is built in one ubatch; a smaller draft ubatch splits it and the drafts are read from wrong rows
+        if (result.n_ubatch < per_seq) {
+            LOG_WRN("%s: --spec-draft-n-ubatch %d is below the chain length %d, using %d\n",
+                    __func__, result.n_ubatch, per_seq, per_seq);
+            result.n_ubatch = per_seq;
+        }
     }
 
     return result;

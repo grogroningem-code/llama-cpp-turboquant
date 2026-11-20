@@ -47,12 +47,16 @@ int main(int argc, char ** argv) {
     // tokenize prompt
     std::vector<llama_token> tokens(70, 1);
 
-    // interleave the 3 sequences:
-    // 01201230123...
+    // interleave the 3 sequences two tokens at a time, with distinct tokens per sequence and position:
+    // 001122001122...
+    // so removing seq 1 leaves 2-cell holes, the restore is split into runs of 2 cells, and a wrong run offset
+    // changes the bytes checked below
     llama_batch batch = llama_batch_init(params.n_parallel*tokens.size(), 0, 1);
-    for (size_t i = 0; i < tokens.size(); i++) {
+    for (size_t i = 0; i < tokens.size(); i += 2) {
         for (int s = 0; s < params.n_parallel; ++s) {
-            common_batch_add(batch, tokens[i], i, {s}, false);
+            for (size_t k = i; k < i + 2; ++k) {
+                common_batch_add(batch, (llama_token) (100 + 3*k + s), k, {s}, false);
+            }
         }
     }
     batch.logits[batch.n_tokens - 1] = true;
@@ -95,6 +99,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "%s : restored state into seq 1, %zu bytes\n", __func__, nset);
+
+    // save seq 1 again: the restored rows must be byte-identical to the saved ones
+    std::vector<uint8_t> seq_state2(llama_state_seq_get_size(ctx, 1));
+    if (llama_state_seq_get_data(ctx, seq_state2.data(), seq_state2.size(), 1) != seq_state2.size() ||
+            seq_state2 != seq_state) {
+        fprintf(stderr, "%s : FAILED: seq 1 saved after the restore differs from the restored state\n", __func__);
+        llama_batch_free(batch);
+        return 1;
+    }
+    fprintf(stderr, "%s : re-saved seq 1 matches the restored state byte for byte\n", __func__);
 
     // Verify we can decode with the restored state
     // Generate one token to verify the restored state is usable
