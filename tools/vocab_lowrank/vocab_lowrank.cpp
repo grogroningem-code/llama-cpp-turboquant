@@ -17,6 +17,12 @@
 #include <string>
 #include <vector>
 
+// _fseeki64/_ftelli64 are MSVC names; elsewhere off_t is 64-bit and fseeko/ftello do the same
+#ifndef _WIN32
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#endif
+
 static void usage(const char * prog) {
     printf("usage: %s -m model.gguf -o lowrank.gguf [-r 128] [-q 2] [--weight-act calib.txt] [--weight-freq freq.bin|file.txt] [--eval file.txt [-n 200] [-k 128]]\n", prog);
 }
