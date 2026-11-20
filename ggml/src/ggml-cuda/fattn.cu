@@ -2794,6 +2794,17 @@ static bool ggml_cuda_turbo_mma_fused() {
     return v;
 }
 
+// Largest query batch (Q->ne[1]) the fused turbo MMA decode path takes; bigger batches get the f16 conversion.
+// GGML_TURBO_MMA_FUSED_MAX_Q=N, default 4. Batches above ncols1 run as several column tiles of the same kernel.
+static int ggml_cuda_turbo_mma_fused_max_q() {
+    static const int v = []{
+        const char * s = getenv("GGML_TURBO_MMA_FUSED_MAX_Q");
+        const int n = s ? atoi(s) : 4;
+        return n >= 1 ? n : 4;
+    }();
+    return v;
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -3557,7 +3568,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (((K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0) && (Q->ne[0] == 128 || Q->ne[0] == 256)) ||
              (K->type == GGML_TYPE_TURBO2_0 && Q->ne[0] == 128));
         if (ggml_cuda_turbo_mma_fused() && (turbo56_matched || turbo234_matched)
-                && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+                && Q->ne[1] <= ggml_cuda_turbo_mma_fused_max_q() && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             if (turbo56_matched) {
                 switch (Q->ne[0]) {
                     case 128: ggml_cuda_flash_attn_ext_mma_turbo56<128>(ctx, dst); return;
