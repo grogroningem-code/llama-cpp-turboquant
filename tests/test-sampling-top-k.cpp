@@ -63,6 +63,9 @@ static void test_top_k_logits(const std::vector<float> & logits, int32_t k, bool
     }
 }
 
+// called from test-sampling.cpp main; declared here so GCC does not warn (-Wmissing-declarations)
+void test_top_k_logits();
+
 void test_top_k_logits() {
     std::mt19937 rng(42);
 
